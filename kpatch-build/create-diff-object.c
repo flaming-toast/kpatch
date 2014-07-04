@@ -49,7 +49,7 @@
 #include "list.h"
 #include "lookup.h"
 #include "asm/insn.h"
-#include "kpatch.h"
+#include "kpatch-patch.h"
 
 #define ERROR(format, ...) \
 	error(1, 0, "%s: %d: " format, __FUNCTION__, __LINE__, ##__VA_ARGS__)
@@ -180,6 +180,16 @@ int is_rela_section(struct section *sec)
 	return (sec->sh.sh_type == SHT_RELA);
 }
 
+int is_debug_section(struct section *sec)
+{
+	char *name;
+	if (is_rela_section(sec))
+		name = sec->base->name;
+	else
+		name = sec->name;
+	return !strncmp(name, ".debug_", 7);
+}
+
 struct section *find_section_by_index(struct list_head *list, unsigned int index)
 {
 	struct section *sec;
@@ -271,7 +281,7 @@ int offset_of_string(struct list_head *list, char *name)
  * **********/
 void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 {
-	int rela_nr, index = 0;
+	int rela_nr, index = 0, skip = 0;
 	struct rela *rela;
 	unsigned int symndx;
 
@@ -287,6 +297,11 @@ void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 
 	log_debug("\n=== rela list for %s (%d entries) ===\n",
 		sec->base->name, rela_nr);
+
+	if (is_debug_section(sec)) {
+		log_debug("skipping rela listing for .debug_* section\n");
+		skip = 1;
+	}
 
 	/* read and store the rela entries */
 	while (rela_nr--) {
@@ -309,6 +324,8 @@ void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 				ERROR("could not lookup rela string\n");
 		}
 
+		if (skip)
+			continue;
 		log_debug("offset %d, type %d, %s %s %d", rela->offset,
 			rela->type, rela->sym->name,
 			(rela->addend < 0)?"-":"+", abs(rela->addend));
@@ -798,11 +815,6 @@ void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 			 */
 			if (rela->sym->type == STT_SECTION &&
 			    rela->sym->sec && rela->sym->sec->sym) {
-
-				log_debug("replacing %s with %s\n",
-					  rela->sym->name,
-					  rela->sym->sec->sym->name);
-
 				rela->sym = rela->sym->sec->sym;
 				continue;
 			}
@@ -838,10 +850,6 @@ void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 				if (sym->sym.st_value != rela->addend + add_off)
 					continue;
 
-				log_debug("replacing %s+%d with %s+%d\n",
-					  rela->sym->name, rela->addend,
-					  sym->name, -add_off);
-
 				rela->sym = sym;
 				rela->addend = -add_off;
 				break;
@@ -864,6 +872,9 @@ void kpatch_dump_kelf(struct kpatch_elf *kelf)
 		printf("%02d %s (%s)", sec->index, sec->name, status_str(sec->status));
 		if (is_rela_section(sec)) {
 			printf(", base-> %s\n", sec->base->name);
+			/* skip .debug_* sections */
+			if (is_debug_section(sec))
+				goto next;
 			printf("rela section expansion\n");
 			list_for_each_entry(rela, &sec->relas, list) {
 				printf("sym %d, offset %d, type %d, %s %s %d\n",
@@ -880,6 +891,7 @@ void kpatch_dump_kelf(struct kpatch_elf *kelf)
 			if (sec->rela)
 				printf(", rela-> %s", sec->rela->name);
 		}
+next:
 		printf("\n");
 	}
 
@@ -936,7 +948,8 @@ void kpatch_include_symbol(struct symbol *sym, int recurselevel)
 	 * if an unchanged local symbol.  This a base case for the
 	 * inclusion recursion.
 	 */
-	if (!sym->sec || (sym->type != STT_SECTION && sym->status == SAME))
+	if (!sym->sec || sym->sec->include ||
+	    (sym->type != STT_SECTION && sym->status == SAME))
 		goto out;
 	sec = sym->sec;
 	sec->include = 1;
@@ -949,11 +962,8 @@ void kpatch_include_symbol(struct symbol *sym, int recurselevel)
 		goto out;
 	sec->rela->include = 1;
 	inc_printf("section %s is included\n", sec->rela->name);
-	list_for_each_entry(rela, &sec->rela->relas, list) {
-		if (rela->sym->include)
-			continue;
+	list_for_each_entry(rela, &sec->rela->relas, list)
 		kpatch_include_symbol(rela->sym, recurselevel+1);
-	}
 out:
 	inc_printf("end include_symbol(%s)\n", sym->name);
 	return;
@@ -973,6 +983,76 @@ void kpatch_include_standard_elements(struct kpatch_elf *kelf)
 
 	/* include the NULL symbol */
 	list_entry(kelf->symbols.next, struct symbol, list)->include = 1;
+}
+
+void kpatch_include_hook_elements(struct kpatch_elf *kelf)
+{
+	struct section *sec;
+	struct symbol *sym;
+	struct rela *rela;
+
+	/* include load/unload sections */
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (!strcmp(sec->name, ".kpatch.hooks.load") ||
+		    !strcmp(sec->name, ".kpatch.hooks.unload") ||
+		    !strcmp(sec->name, ".rela.kpatch.hooks.load") ||
+		    !strcmp(sec->name, ".rela.kpatch.hooks.unload")) {
+			sec->include = 1;
+			if (is_rela_section(sec)) {
+				/* include hook dependencies */
+				rela = list_entry(sec->relas.next,
+			                         struct rela, list);
+				sym = rela->sym;
+				log_normal("found hook: %s\n",sym->name);
+				kpatch_include_symbol(sym, 0);
+				/* strip the hook symbol */
+				sym->include = 0;
+				/* use section symbol instead */
+				rela->sym = sym->sec->secsym;
+			} else {
+				sec->secsym->include = 1;
+			}
+		}
+	}
+
+	/*
+	 * Strip temporary global load/unload function pointer objects
+	 * used by the kpatch_[load|unload]() macros.
+	 */
+	list_for_each_entry(sym, &kelf->symbols, list)
+		if (!strcmp(sym->name, "kpatch_load_data") ||
+		    !strcmp(sym->name, "kpatch_unload_data"))
+			sym->include = 0;
+}
+
+void kpatch_include_force_elements(struct kpatch_elf *kelf)
+{
+	struct section *sec;
+	struct symbol *sym;
+	struct rela *rela;
+
+	/* include force sections */
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (!strcmp(sec->name, ".kpatch.force") ||
+		    !strcmp(sec->name, ".rela.kpatch.force")) {
+			sec->include = 1;
+			if (!is_rela_section(sec)) {
+				/* .kpatch.force */
+				sec->secsym->include = 1;
+				continue;
+			}
+			/* .rela.kpatch.force */
+			list_for_each_entry(rela, &sec->relas, list)
+				log_normal("function '%s' marked with KPATCH_FORCE_UNSAFE!\n",
+				           rela->sym->name);
+		}
+	}
+
+	/* strip temporary global kpatch_force_func_* symbols */
+	list_for_each_entry(sym, &kelf->symbols, list)
+		if (!strncmp(sym->name, "__kpatch_force_func_",
+		            strlen("__kpatch_force_func_")))
+			sym->include = 0;
 }
 
 int kpatch_include_changed_functions(struct kpatch_elf *kelf)
@@ -1266,6 +1346,32 @@ void kpatch_regenerate_special_section(struct special_section *special,
 	sec->base->data->d_size = dest_offset;
 }
 
+void kpatch_include_debug_sections(struct kpatch_elf *kelf)
+{
+	struct section *sec;
+	struct rela *rela, *saferela;
+
+	/* include all .debug_* sections */
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (is_debug_section(sec)) {
+			sec->include = 1;
+			if (!is_rela_section(sec))
+				sec->secsym->include = 1;
+		}
+	}
+
+	/*
+	 * Go through the .rela.debug_ sections and strip entries
+	 * referencing unchanged symbols
+	 */
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (!is_rela_section(sec) || !is_debug_section(sec))
+			continue;
+		list_for_each_entry_safe(rela, saferela, &sec->relas, list)
+			if (!rela->sym->sec->include)
+				list_del(&rela->list);
+	}
+}
 
 void kpatch_process_special_sections(struct kpatch_elf *kelf)
 {
@@ -1483,53 +1589,43 @@ void kpatch_create_symtab(struct kpatch_elf *kelf)
 	symtab->sh.sh_info = nr_local;
 }
 
-void kpatch_create_patches_sections(struct kpatch_elf *kelf,
-                                    struct lookup_table *table, char *hint,
-                                    char *objname)
+struct section *create_section_pair(struct kpatch_elf *kelf, char *name,
+                                    int entsize, int nr)
 {
-	int nr, size, index, objname_offset;
+	char *relaname;
 	struct section *sec, *relasec;
-	struct symbol *sym, *strsym;
-	struct rela *rela;
-	struct lookup_result result;
-	struct kpatch_patch *patches;
+	int size = entsize * nr;
 
-	/* count patched functions */
-	nr = 0;
-	list_for_each_entry(sym, &kelf->symbols, list)
-		if (sym->type == STT_FUNC && sym->status == CHANGED)
-			nr++;
-
-	/* create .kpatch.patches */
-
-	/* allocate section resources */
-	ALLOC_LINK(sec, &kelf->sections);
-	size = nr * sizeof(*patches);
-	patches = malloc(size);
-	if (!patches)
+	relaname = malloc(strlen(name) + strlen(".rela") + 1);
+	if (!relaname)
 		ERROR("malloc");
-	sec->name = ".kpatch.patches";
+	strcpy(relaname, ".rela");
+	strcat(relaname, name);
+
+	/* allocate text section resources */
+	ALLOC_LINK(sec, &kelf->sections);
+	sec->name = name;
 
 	/* set data */
 	sec->data = malloc(sizeof(*sec->data));
 	if (!sec->data)
 		ERROR("malloc");
-	sec->data->d_buf = patches;
+	sec->data->d_buf = malloc(size);
+	if (!sec->data->d_buf)
+		ERROR("malloc");
 	sec->data->d_size = size;
 	sec->data->d_type = ELF_T_BYTE;
 
 	/* set section header */
 	sec->sh.sh_type = SHT_PROGBITS;
-	sec->sh.sh_entsize = sizeof(*patches);
+	sec->sh.sh_entsize = entsize;
 	sec->sh.sh_addralign = 8;
 	sec->sh.sh_flags = SHF_ALLOC;
 	sec->sh.sh_size = size;
 
-	/* create .rela.patches */
-
-	/* allocate section resources */
+	/* allocate rela section resources */
 	ALLOC_LINK(relasec, &kelf->sections);
-	relasec->name = ".rela.kpatch.patches";
+	relasec->name = relaname;
 	relasec->base = sec;
 	INIT_LIST_HEAD(&relasec->relas);
 
@@ -1542,6 +1638,34 @@ void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 	relasec->sh.sh_type = SHT_RELA;
 	relasec->sh.sh_entsize = sizeof(GElf_Rela);
 	relasec->sh.sh_addralign = 8;
+
+	/* set text rela section pointer */
+	sec->rela = relasec;
+
+	return sec;
+}
+
+void kpatch_create_patches_sections(struct kpatch_elf *kelf,
+                                    struct lookup_table *table, char *hint,
+                                    char *objname)
+{
+	int nr, index, objname_offset;
+	struct section *sec, *relasec;
+	struct symbol *sym, *strsym;
+	struct rela *rela;
+	struct lookup_result result;
+	struct kpatch_patch_func *funcs;
+
+	/* count patched functions */
+	nr = 0;
+	list_for_each_entry(sym, &kelf->symbols, list)
+		if (sym->type == STT_FUNC && sym->status == CHANGED)
+			nr++;
+
+	/* create text/rela section pair */
+	sec = create_section_pair(kelf, ".kpatch.funcs", sizeof(*funcs), nr);
+	relasec = sec->rela;
+	funcs = sec->data->d_buf;
 
 	/* lookup strings symbol */
 	strsym = find_symbol_by_name(&kelf->symbols, ".kpatch.strings");
@@ -1570,42 +1694,42 @@ void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 			          sym->name, result.value, result.size);
 
 			/* add entry in text section */
-			patches[index].old_offset = result.value;
-			patches[index].old_size = result.size;
-			patches[index].new_size = sym->sym.st_size;
+			funcs[index].old_offset = result.value;
+			funcs[index].old_size = result.size;
+			funcs[index].new_size = sym->sym.st_size;
 
 			/*
 			 * Add a relocation that will populate
-			 * the patches[index].new_addr field at
+			 * the funcs[index].new_addr field at
 			 * module load time.
 			 */
 			ALLOC_LINK(rela, &relasec->relas);
 			rela->sym = sym;
 			rela->type = R_X86_64_64;
 			rela->addend = 0;
-			rela->offset = index * sizeof(*patches);
+			rela->offset = index * sizeof(*funcs);
 
 			/*
 			 * Add a relocation that will populate
-			 * the patches[index].name field.
+			 * the funcs[index].name field.
 			 */
 			ALLOC_LINK(rela, &relasec->relas);
 			rela->sym = strsym;
 			rela->type = R_X86_64_64;
 			rela->addend = offset_of_string(&kelf->strings, sym->name);
-			rela->offset = index * sizeof(*patches) +
-			               offsetof(struct kpatch_patch, name);
+			rela->offset = index * sizeof(*funcs) +
+			               offsetof(struct kpatch_patch_func, name);
 
 			/*
 			 * Add a relocation that will populate
-			 * the patches[index].objname field.
+			 * the funcs[index].objname field.
 			 */
 			ALLOC_LINK(rela, &relasec->relas);
 			rela->sym = strsym;
 			rela->type = R_X86_64_64;
 			rela->addend = objname_offset;
-			rela->offset = index * sizeof(*patches) +
-			               offsetof(struct kpatch_patch, objname);
+			rela->offset = index * sizeof(*funcs) +
+			               offsetof(struct kpatch_patch_func,objname);
 
 			index++;
 		}
@@ -1613,7 +1737,7 @@ void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 
 	/* sanity check, index should equal nr */
 	if (index != nr)
-		ERROR("size mismatch in patches sections");
+		ERROR("size mismatch in funcs sections");
 
 }
 
@@ -1621,64 +1745,31 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
                                          struct lookup_table *table, char *hint,
                                          char *objname)
 {
-	int nr, size, index, objname_offset;
+	int nr, index, objname_offset;
 	struct section *sec, *sec2, *relasec;
 	struct rela *rela, *dynrela, *safe;
 	struct symbol *strsym;
 	struct lookup_result result;
-	struct kpatch_dynrela *dynrelas;
+	struct kpatch_patch_dynrela *dynrelas;
+	int vmlinux, exported;
+
+	vmlinux = !strcmp(objname, "vmlinux");
 
 	/* count rela entries that need to be dynamic */
 	nr = 0;
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (!is_rela_section(sec))
 			continue;
-		if (!strcmp(sec->name, ".rela.kpatch.patches"))
+		if (!strcmp(sec->name, ".rela.kpatch.funcs"))
 			continue;
 		list_for_each_entry(rela, &sec->relas, list)
 			nr++; /* upper bound on number of dynrelas */
 	}
 
-	/* create .kpatch.dynrelas*/
-
-	/* allocate section resources */
-	ALLOC_LINK(sec, &kelf->sections);
-	size = nr * sizeof(*dynrelas);
-	dynrelas = malloc(size);
-	if (!dynrelas)
-		ERROR("malloc");
-	sec->name = ".kpatch.dynrelas";
-
-	/* set data */
-	sec->data = malloc(sizeof(*sec->data));
-	if (!sec->data)
-		ERROR("malloc");
-	sec->data->d_buf = dynrelas;
-	sec->data->d_type = ELF_T_BYTE;
-
-	/* set section header */
-	sec->sh.sh_type = SHT_PROGBITS;
-	sec->sh.sh_entsize = sizeof(*dynrelas);
-	sec->sh.sh_addralign = 8;
-	sec->sh.sh_flags = SHF_ALLOC;
-
-	/* create .rela.kpatch.dynrelas*/
-
-	/* allocate section resources */
-	ALLOC_LINK(relasec, &kelf->sections);
-	relasec->name = ".rela.kpatch.dynrelas";
-	relasec->base = sec;
-	INIT_LIST_HEAD(&relasec->relas);
-
-	/* set data, buffers generated by kpatch_rebuild_rela_section_data() */
-	relasec->data = malloc(sizeof(*relasec->data));
-	if (!relasec->data)
-		ERROR("malloc");
-
-	/* set section header */
-	relasec->sh.sh_type = SHT_RELA;
-	relasec->sh.sh_entsize = sizeof(GElf_Rela);
-	relasec->sh.sh_addralign = 8;
+	/* create text/rela section pair */
+	sec = create_section_pair(kelf, ".kpatch.dynrelas", sizeof(*dynrelas), nr);
+	relasec = sec->rela;
+	dynrelas = sec->data->d_buf;
 
 	/* lookup strings symbol */
 	strsym = find_symbol_by_name(&kelf->symbols, ".kpatch.strings");
@@ -1699,44 +1790,55 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 		list_for_each_entry_safe(rela, safe, &sec2->relas, list) {
 			if (rela->sym->sec)
 				continue;
+
+			exported = 0;
+
 			if (rela->sym->bind == STB_LOCAL) {
 				/* An unchanged local symbol */
 				if (lookup_local_symbol(table, rela->sym->name,
 				                        hint, &result))
 					ERROR("lookup_local_symbol %s (%s) needed for %s",
 			               rela->sym->name, hint, sec2->base->name);
+			}
+			else if (vmlinux) {
+				/*
+				 * We have a patch to vmlinux which references
+				 * a global symbol.  Use a normal rela for
+				 * exported symbols and a dynrela otherwise.
+				 */
+				if (lookup_is_exported_symbol(table, rela->sym->name))
+					continue;
+				if (lookup_global_symbol(table, rela->sym->name,
+							 &result))
+					ERROR("lookup_global_symbol failed for %s, needed for %s\n",
+					      rela->sym->name,
+					      sec2->base->name);
 			} else {
 				/*
-				 *  Symbol is global, could be an object-level
-				 *  global not defined in this file or exported
-				 *  by another object.
-				 */
-				if (!strcmp(objname, "vmlinux") &&
-				    lookup_is_exported_symbol(table, rela->sym->name))
-					continue;
-
-				 /*
-				 * Try to find global symbol.  If none is
-				 * found, assume it is exported and no dynrela
-				 * is needed.  If the symbol is not exported,
-				 * the final patch module will fail to load.
+				 * We have a patch to a module which references
+				 * a global symbol.  First try to find it in
+				 * the module being patched.
 				 */
 				if (lookup_global_symbol(table, rela->sym->name,
-			                             &result))
+							 &result))
 					/*
-					 * Symbol is not a kernel object
-					 * global. Assume symbol is exported by
-					 * vmlinux or another kernel module.
+					 * Not there, assume it's exported by
+					 * another object.
 					 */
-					continue;
+					exported = 1;
 			}
 			log_debug("lookup for %s @ 0x%016lx len %lu\n",
 			          rela->sym->name, result.value, result.size);
 
 			/* dest filed in by rela entry below */
-			dynrelas[index].src = result.value;
+			if (vmlinux)
+				dynrelas[index].src = result.value;
+			else
+				/* for modules, src is discovered at runtime */
+				dynrelas[index].src = 0;
 			dynrelas[index].addend = rela->addend;
 			dynrelas[index].type = rela->type;
+			dynrelas[index].exported = exported;
 
 			/* add rela to fill in dest field */
 			ALLOC_LINK(dynrela, &relasec->relas);
@@ -1753,7 +1855,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 			dynrela->sym = strsym;
 			dynrela->type = R_X86_64_64;
 			dynrela->addend = offset_of_string(&kelf->strings, rela->sym->name);
-			dynrela->offset = index * sizeof(*dynrelas) + offsetof(struct kpatch_dynrela, name);
+			dynrela->offset = index * sizeof(*dynrelas) + offsetof(struct kpatch_patch_dynrela, name);
 
 			/* add rela to fill in objname field */
 			ALLOC_LINK(dynrela, &relasec->relas);
@@ -1761,7 +1863,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 			dynrela->type = R_X86_64_64;
 			dynrela->addend = objname_offset;
 			dynrela->offset = index * sizeof(*dynrelas) +
-				offsetof(struct kpatch_dynrela, objname);
+				offsetof(struct kpatch_patch_dynrela, objname);
 
 			list_del(&rela->list);
 			free(rela);
@@ -1772,8 +1874,106 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 	}
 
 	/* set size to actual number of dynrelas */
-	sec->data->d_size = index * sizeof(struct kpatch_dynrela);
+	sec->data->d_size = index * sizeof(struct kpatch_patch_dynrela);
 	sec->sh.sh_size = sec->data->d_size;
+}
+
+void kpatch_create_hooks_objname_rela(struct kpatch_elf *kelf, char *objname)
+{
+	struct section *sec;
+	struct rela *rela;
+	struct symbol *strsym;
+	int objname_offset;
+
+	/* lookup strings symbol */
+	strsym = find_symbol_by_name(&kelf->symbols, ".kpatch.strings");
+	if (!strsym)
+		ERROR("can't find .kpatch.strings symbol");
+
+	/* add objname to strings */
+	objname_offset = offset_of_string(&kelf->strings, objname);
+
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (strcmp(sec->name, ".rela.kpatch.hooks.load") &&
+		    strcmp(sec->name, ".rela.kpatch.hooks.unload"))
+			continue;
+
+		ALLOC_LINK(rela, &sec->relas);
+		rela->sym = strsym;
+		rela->type = R_X86_64_64;
+		rela->addend = objname_offset;
+		rela->offset = offsetof(struct kpatch_patch_hook, objname);
+	}
+}
+
+/*
+ * This function basically reimplements the functionality of the Linux
+ * recordmcount script, so that patched functions can be recognized by ftrace.
+ *
+ * TODO: Eventually we can modify recordmount so that it recognizes our bundled
+ * sections as valid and does this work for us.
+ */
+void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
+{
+	int nr, index;
+	struct section *sec, *relasec;
+	struct symbol *sym;
+	struct rela *rela;
+	void **funcs, *newdata;
+	unsigned char *insn;
+
+	nr = 0;
+	list_for_each_entry(sym, &kelf->symbols, list)
+		if (sym->type == STT_FUNC && sym->status != SAME)
+			nr++;
+
+	/* create text/rela section pair */
+	sec = create_section_pair(kelf, "__mcount_loc", sizeof(*funcs), nr);
+	relasec = sec->rela;
+	funcs = sec->data->d_buf;
+
+	/* populate sections */
+	index = 0;
+	list_for_each_entry(sym, &kelf->symbols, list) {
+		if (sym->type != STT_FUNC || sym->status == SAME)
+			continue;
+
+		/* add rela in .rela__mcount_loc to fill in function pointer */
+		ALLOC_LINK(rela, &relasec->relas);
+		rela->sym = sym;
+		rela->type = R_X86_64_64;
+		rela->addend = 0;
+		rela->offset = index * sizeof(*funcs);
+
+		/*
+		 * Modify the first instruction of the function to "callq
+		 * __fentry__" so that ftrace will be happy.
+		 */
+		newdata = malloc(sym->sec->data->d_size);
+		memcpy(newdata, sym->sec->data->d_buf, sym->sec->data->d_size);
+		sym->sec->data->d_buf = newdata;
+		insn = newdata;
+		if (insn[0] != 0xf)
+			ERROR("bad first instruction in %s", sym->name);
+		insn[0] = 0xe8;
+		insn[1] = 0;
+		insn[2] = 0;
+		insn[3] = 0;
+		insn[4] = 0;
+
+		rela = list_first_entry(&sym->sec->rela->relas, struct rela,
+					list);
+		if (rela->type != R_X86_64_NONE ||
+		    strcmp(rela->sym->name, "__fentry__"))
+			ERROR("bad first rela in %s", sym->sec->rela->name);
+		rela->type = R_X86_64_PC32;
+
+		index++;
+	}
+
+	/* sanity check, index should equal nr */
+	if (index != nr)
+		ERROR("size mismatch in funcs sections");
 }
 
 /*
@@ -2050,7 +2250,7 @@ int main(int argc, char *argv[])
 	struct lookup_table *lookup;
 	struct section *sec, *symtab;
 	struct symbol *sym;
-	char *hint, *name, *pos;
+	char *hint = NULL, *name, *pos;
 
 	arguments.debug = 0;
 	argp_parse (&argp, argc, argv, 0, 0, &arguments);
@@ -2094,6 +2294,9 @@ int main(int argc, char *argv[])
 
 	kpatch_include_standard_elements(kelf_patched);
 	num_changed = kpatch_include_changed_functions(kelf_patched);
+	kpatch_include_debug_sections(kelf_patched);
+	kpatch_include_hook_elements(kelf_patched);
+	kpatch_include_force_elements(kelf_patched);
 	kpatch_dump_kelf(kelf_patched);
 	kpatch_verify_patchability(kelf_patched);
 
@@ -2119,6 +2322,8 @@ int main(int argc, char *argv[])
 			break;
 		}
 	}
+	if (!hint)
+		ERROR("FILE symbol not found in output. Stripped?\n");
 
 	/* create symbol lookup table */
 	lookup = lookup_open(arguments.args[2]);
@@ -2142,7 +2347,10 @@ int main(int argc, char *argv[])
 	kpatch_create_strings_elements(kelf_out);
 	kpatch_create_patches_sections(kelf_out, lookup, hint, name);
 	kpatch_create_dynamic_rela_sections(kelf_out, lookup, hint, name);
+	kpatch_create_hooks_objname_rela(kelf_out, name);
 	kpatch_build_strings_section_data(kelf_out);
+
+	kpatch_create_mcount_sections(kelf_out);
 
 	/*
 	 *  At this point, the set of output sections and symbols is

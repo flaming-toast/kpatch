@@ -23,46 +23,73 @@
 #ifndef _KPATCH_H_
 #define _KPATCH_H_
 
-struct kpatch_patch {
+#include <linux/types.h>
+#include <linux/module.h>
+
+enum kpatch_op {
+	KPATCH_OP_NONE,
+	KPATCH_OP_PATCH,
+	KPATCH_OP_UNPATCH,
+};
+
+struct kpatch_func {
+	/* public */
 	unsigned long new_addr;
 	unsigned long new_size;
 	unsigned long old_offset;
 	unsigned long old_size;
-	char *name;
-	char *objname;
+	const char *name;
+	struct list_head list;
+	int force;
+
+	/* private */
+	struct hlist_node node;
+	unsigned long old_addr;
+	enum kpatch_op op;
 };
 
 struct kpatch_dynrela {
 	unsigned long dest;
 	unsigned long src;
 	unsigned long type;
-	char *name;
-	char *objname;
+	const char *name;
 	int addend;
+	int exported;
+	struct list_head list;
 };
 
-#ifdef __KERNEL__
+struct kpatch_hook {
+	struct list_head list;
+	void (*hook)(void);
+};
 
-#include <linux/types.h>
-#include <linux/module.h>
+struct kpatch_object {
+	struct list_head list;
+	const char *name;
+	struct list_head funcs;
+	struct list_head dynrelas;
+	struct list_head hooks_load;
+	struct list_head hooks_unload;
 
-struct kpatch_internal;
+	/* private */
+	struct module *mod;
+};
 
 struct kpatch_module {
+	/* public */
 	struct module *mod;
-	struct kpatch_patch *patches;
-	struct kpatch_dynrela *dynrelas;
-	int patches_nr;
-	int dynrelas_nr;
+	struct list_head objects;
+
+	/* public read-only */
 	bool enabled;
-	struct kpatch_internal *internal; /* used internally by core module */
+
+	/* private */
+	struct list_head list;
 };
 
 extern struct kobject *kpatch_patches_kobj;
 
 extern int kpatch_register(struct kpatch_module *kpmod, bool replace);
 extern int kpatch_unregister(struct kpatch_module *kpmod);
-
-#endif /* __KERNEL__ */
 
 #endif /* _KPATCH_H_ */

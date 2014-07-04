@@ -40,28 +40,48 @@ BASE="$PWD"
 LOGFILE="/tmp/kpatch-build-$(date +%s).log"
 SCRIPTDIR="$(readlink -f $(dirname $(type -p $0)))"
 ARCHVERSION="$(uname -r)"
-CPUS="$(grep -c ^processor /proc/cpuinfo)"
+CPUS="$(getconf _NPROCESSORS_ONLN)"
 CACHEDIR="$HOME/.kpatch"
+SRCDIR="$CACHEDIR/src"
+OBJDIR="$CACHEDIR/obj"
+OBJDIR2="$CACHEDIR/obj2"
+VERSIONFILE="$CACHEDIR/version"
 TEMPDIR=
-STRIPCMD="strip -d --keep-file-symbols"
-APPLIEDPATCHFILE="applied-patch"
+APPLIEDPATCHFILE="kpatch.patch"
 DEBUG=0
+
+warn() {
+	echo "ERROR: $1" >&2
+}
 
 die() {
 	if [[ -z $1 ]]; then
-		echo "ERROR: kpatch build failed. Check $LOGFILE for more details." >&2
+		warn "kpatch build failed. Check $LOGFILE for more details."
 	else
-		echo "ERROR: $1" >&2
+		warn "$1"
 	fi
 	exit 1
 }
 
 cleanup() {
-	[[ "$DEBUG" -eq 0 ]] && rm -rf "$TEMPDIR"
 	if [[ -e "$SRCDIR/$APPLIEDPATCHFILE" ]]; then
 		patch -p1 -R -d "$SRCDIR" < "$SRCDIR/$APPLIEDPATCHFILE" &> /dev/null
 		rm -f "$SRCDIR/$APPLIEDPATCHFILE"
 	fi
+	if [[ -n $USERSRCDIR ]]; then
+		# restore original .config and vmlinux since they were removed
+		# with mrproper
+		[[ -e $TEMPDIR/vmlinux ]] && cp -f $TEMPDIR/vmlinux $USERSRCDIR
+		[[ -e $TEMPDIR/.config ]] && cp -f $TEMPDIR/.config $USERSRCDIR
+	fi
+	[[ "$DEBUG" -eq 0 ]] && rm -rf "$TEMPDIR"
+	unset KCFLAGS
+}
+
+clean_cache() {
+	[[ -z $USERSRCDIR ]] && rm -rf "$SRCDIR"
+	rm -rf "$OBJDIR" "$OBJDIR2" "$VERSIONFILE"
+	mkdir -p "$OBJDIR"
 }
 
 find_dirs() {
@@ -80,6 +100,25 @@ find_dirs() {
 	fi
 
 	return 1
+}
+
+gcc_version_check() {
+	# ensure gcc version matches that used to build the kernel
+	local gccver=$(gcc --version |head -n1 |cut -d' ' -f3-)
+	local kgccver=$(strings $VMLINUX |grep "GCC:" |head -n1 |cut -d' ' -f3-)
+	if [[ $gccver != $kgccver ]]; then
+		warn "gcc/kernel version mismatch"
+		return 1
+	fi
+
+	# ensure gcc version is >= 4.8
+	gccver=$(echo $gccver |cut -d'.' -f1,2)
+	if [[ $gccver < 4.8 ]]; then
+		warn "gcc >= 4.8 required"
+		return 1
+	fi
+
+	return
 }
 
 find_parent_obj() {
@@ -138,7 +177,7 @@ usage() {
 	echo "		-d, --debug	Keep scratch files in /tmp" >&2
 }
 
-options=$(getopt -o hr:s:c:v:t:d -l "help,sourcerpm:,sourcedir:,config:,vmlinux:,target:debug" -- "$@") || die "getopt failed"
+options=$(getopt -o hr:s:c:v:t:d -l "help,sourcerpm:,sourcedir:,config:,vmlinux:,target:,debug" -- "$@") || die "getopt failed"
 
 eval set -- "$options"
 
@@ -182,7 +221,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--)
 		if [[ -z "$2" ]]; then
-			echo "ERROR: no patch file specified" >&2
+			warn "no patch file specified"
 			usage
 			exit 1
 		fi
@@ -194,9 +233,21 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 
-SRCDIR="$CACHEDIR/src"
-OBJDIR="$CACHEDIR/obj"
-OBJDIR2="$CACHEDIR/obj2"
+TEMPDIR="$(mktemp -d /tmp/kpatch-build-XXXXXX)" || die "mktemp failed"
+trap cleanup EXIT INT TERM
+
+if [[ -n $USERSRCDIR ]]; then
+	# save .config and vmlinux since they'll get removed with mrproper so
+	# we can restore them later and be able to run kpatch-build multiple
+	# times on the same sourcedir
+	[[ -z $CONFIGFILE ]] && CONFIGFILE="$USERSRCDIR"/.config
+	[[ ! -e "$CONFIGFILE" ]] && die "can't find config file"
+	[[ "$CONFIGFILE" = "$USERSRCDIR"/.config ]] && cp -f "$CONFIGFILE" $TEMPDIR
+
+	[[ -z $VMLINUX ]] && VMLINUX="$USERSRCDIR"/vmlinux
+	[[ ! -e "$VMLINUX" ]] && die "can't find vmlinux"
+	[[ "$VMLINUX" = "$USERSRCDIR"/vmlinux ]] && cp -f "$VMLINUX" $TEMPDIR/vmlinux && VMLINUX=$TEMPDIR/vmlinux
+fi
 
 [[ -z $TARGETS ]] && TARGETS="vmlinux modules"
 
@@ -208,10 +259,6 @@ fi
 # Only allow alphanumerics and '_' and '-' in the module name.
 # Everything else is replaced with '-'.
 PATCHNAME=${PATCHNAME//[^a-zA-Z0-9_-]/-}
-
-TEMPDIR="$(mktemp -d /tmp/kpatch-build-XXXXXX)" || die "mktemp failed"
-
-trap cleanup EXIT INT TERM
 
 find_dirs || die "can't find supporting tools"
 
@@ -225,32 +272,36 @@ if [[ $DISTRO = fedora ]] || [[ $DISTRO = rhel ]]; then
 
 	export PATH=/usr/lib64/ccache:$PATH
 
-elif [[ $DISTRO = ubuntu ]]; then
+elif [[ $DISTRO = ubuntu ]] || [[ $DISTRO = debian ]]; then
 	[[ -z $VMLINUX ]] && VMLINUX=/usr/lib/debug/boot/vmlinux-$ARCHVERSION
-	[[ -e "$VMLINUX" ]] || die "linux-image-$ARCHVERSION-dbgsym not installed"
+
+	if [[ $DISTRO = ubuntu ]]; then
+		[[ -e "$VMLINUX" ]] || die "linux-image-$ARCHVERSION-dbgsym not installed"
+
+        elif [[ $DISTRO = debian ]]; then
+		[[ -e "$VMLINUX" ]] || die "linux-image-$ARCHVERSION-dbg not installed"
+	fi
 
 	export PATH=/usr/lib/ccache:$PATH
 fi
 
+gcc_version_check || die
+
 if [[ -n "$USERSRCDIR" ]]; then
-	SRCDIR="$CACHEDIR/src"
-	OBJDIR="$CACHEDIR/obj"
-	OBJDIR2="$CACHEDIR/obj2"
+	echo "Using source directory at $USERSRCDIR"
+	SRCDIR="$USERSRCDIR"
 
-	rm -rf "$CACHEDIR"
-	mkdir -p "$CACHEDIR"
-	mkdir -p "$OBJDIR" "$OBJDIR2"
+	clean_cache
 
-	if [[ -n "$CONFIGFILE" ]]; then
-		cp "$CONFIGFILE" "$OBJDIR/.config" || die "config file is missing"
-	else
-		cp "$USERSRCDIR/.config" "$OBJDIR" || die "source dir is missing a .config file"
-	fi
+	cp -f "$CONFIGFILE" "$OBJDIR/.config"
 
-	echo "Copying source to $SRCDIR"
-	cp -a "$USERSRCDIR" "$SRCDIR" || die "copy failed"
+	echo "Detecting kernel version"
+	cd "$SRCDIR"
+	make mrproper >> "$LOGFILE" 2>&1 || die "make mrproper failed"
+	make O="$OBJDIR" prepare >> "$LOGFILE" 2>&1 || die "make prepare failed"
+	ARCHVERSION=$(make O="$OBJDIR" kernelrelease) || die "make kernelrelease failed"
 
-elif [[ -e "$SRCDIR" ]] && [[ -e "$CACHEDIR"/version ]] && [[ $(cat "$CACHEDIR"/version) = $ARCHVERSION ]]; then
+elif [[ -e "$SRCDIR" ]] && [[ -e "$VERSIONFILE" ]] && [[ $(cat "$VERSIONFILE") = $ARCHVERSION ]]; then
 	echo "Using cache at $SRCDIR"
 
 else
@@ -270,24 +321,42 @@ else
 		echo "Unpacking kernel source"
 		rpmdev-setuptree >> "$LOGFILE" 2>&1 || die
 		rpm -ivh "$SRCRPM" >> "$LOGFILE" 2>&1 || die
-		rpmbuild -bp "--target=$(uname -m)" "$HOME/rpmbuild/SPECS/kernel.spec" >> "$LOGFILE" 2>&1 ||
+		rpmbuild -bp "--target=$(uname -m)" "$(rpm --eval %{_specdir})"/kernel.spec >> "$LOGFILE" 2>&1 ||
 			die "rpmbuild -bp failed.  you may need to run 'yum-builddep kernel' first."
-		rm -rf "$CACHEDIR"
-		mkdir -p "$OBJDIR"
-		mv "$HOME"/rpmbuild/BUILD/kernel-*/linux-"$ARCHVERSION" "$SRCDIR" >> "$LOGFILE" 2>&1 || die
+
+		clean_cache
+
+		mv "$(rpm --eval %{_builddir})"/kernel-*/linux-"$ARCHVERSION" "$SRCDIR" >> "$LOGFILE" 2>&1 || die
 
 		cp "$SRCDIR/.config" "$OBJDIR" || die
 		echo "-${ARCHVERSION##*-}" > "$SRCDIR/localversion" || die
 
-		echo $ARCHVERSION > "$CACHEDIR"/version || die
+		echo $ARCHVERSION > "$VERSIONFILE" || die
 
-	elif [[ $DISTRO = ubuntu ]]; then
+	elif [[ $DISTRO = ubuntu ]] || [[ $DISTRO = debian ]]; then
 
 		echo "Debian/Ubuntu distribution detected"
 
-		# url may be changed for a different mirror
-		url="http://us.archive.ubuntu.com/ubuntu/pool/main/l/linux"
-		# The linux-source packages are formatted like the following: linux-source-3.13.0_3.13.0-24.46_all.deb
+		if [[ $DISTRO = ubuntu ]]; then
+
+			# url may be changed for a different mirror
+			url="http://us.archive.ubuntu.com/ubuntu/pool/main/l/linux"
+			extension="bz2"
+			sublevel="SUBLEVEL = 0"
+			taroptions="xvjf"
+
+		elif [[ $DISTRO = debian ]]; then
+
+			# url may be changed for a different mirror
+			url="http://ftp.debian.org/debian/pool/main/l/linux"
+			extension="xz"
+			sublevel="SUBLEVEL ="
+			taroptions="xvf"
+		fi
+
+		# The linux-source packages are formatted like the following for:
+		# ubuntu: linux-source-3.13.0_3.13.0-24.46_all.deb
+		# debian: linux-source-3.14_3.14.7-1_all.deb
 		pkgver="${ARCHVERSION%%-*}_$(dpkg-query -W -f='${Version}' linux-image-$(uname -r))"
 		pkgname="linux-source-${pkgver}_all"
 
@@ -299,16 +368,15 @@ else
 		echo "Unpacking kernel source"
 		dpkg -x ${pkgname}.deb $TEMPDIR >> "$LOGFILE" || die "dpkg: Could not extract ${pkgname}.deb"
 		# extract and move to SRCDIR
-		tar xvjf usr/src/linux-source-${ARCHVERSION%%-*}.tar.bz2 >> "$LOGFILE" || die "tar: Failed to extract kernel source package"
-		rm -rf "$CACHEDIR"
-		mkdir -p "$OBJDIR"
+		tar $taroptions usr/src/linux-source-${ARCHVERSION%%-*}.tar.${extension} >> "$LOGFILE" || die "tar: Failed to extract kernel source package"
+		clean_cache
 		mv linux-source-${ARCHVERSION%%-*} "$SRCDIR" || die
 		cp "/boot/config-${ARCHVERSION}" "$OBJDIR/.config" || die
 		echo "-${ARCHVERSION#*-}" > "$SRCDIR/localversion" || die
 		# for some reason the Ubuntu kernel versions don't follow the
 		# upstream SUBLEVEL; they are always at SUBLEVEL 0
-		sed -i "s/^SUBLEVEL.*/SUBLEVEL = 0/" "$SRCDIR/Makefile" || die
-		echo $ARCHVERSION > "$CACHEDIR"/version || die
+		sed -i "s/^SUBLEVEL.*/${sublevel}/" "$SRCDIR/Makefile" || die
+		echo $ARCHVERSION > "$VERSIONFILE" || die
 
 	else
 		die "Unsupported distribution"
@@ -319,11 +387,12 @@ echo "Testing patch file"
 cd "$SRCDIR" || die
 patch -N -p1 --dry-run < "$PATCHFILE" || die "source patch file failed to apply"
 cp "$PATCHFILE" "$APPLIEDPATCHFILE" || die
+cp -LR "$DATADIR/patch" "$TEMPDIR" || die
+export KCFLAGS="-I$DATADIR/patch" # for kpatch-macros.h
 
 echo "Building original kernel"
 make mrproper >> "$LOGFILE" 2>&1 || die
 make "-j$CPUS" $TARGETS "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
-cp -LR "$DATADIR/patch" "$TEMPDIR" || die
 
 echo "Building patched kernel"
 patch -N -p1 < "$APPLIEDPATCHFILE" >> "$LOGFILE" 2>&1 || die
@@ -354,9 +423,9 @@ rm -rf "$OBJDIR2"
 mkdir -p "$OBJDIR2"
 cp "$OBJDIR/.config" "$OBJDIR2" || die
 mkdir "$TEMPDIR/patched"
+export KCFLAGS="$KCFLAGS -ffunction-sections -fdata-sections"
 for i in $(cat $TEMPDIR/changed_objs); do
-	KCFLAGS="-ffunction-sections -fdata-sections" make "$i" "O=$OBJDIR2" >> "$LOGFILE" 2>&1 || die
-	$STRIPCMD "$OBJDIR2/$i" >> "$LOGFILE" 2>&1 || die
+	make "$i" "O=$OBJDIR2" >> "$LOGFILE" 2>&1 || die
 	mkdir -p "$TEMPDIR/patched/$(dirname $i)"
 	cp -f "$OBJDIR2/$i" "$TEMPDIR/patched/$i" || die
 done
@@ -365,8 +434,7 @@ rm -f "$APPLIEDPATCHFILE"
 mkdir "$TEMPDIR/orig"
 for i in $(cat $TEMPDIR/changed_objs); do
 	rm -f "$i"
-	KCFLAGS="-ffunction-sections -fdata-sections" make "$i" "O=$OBJDIR2" >> "$LOGFILE" 2>&1 || die
-	$STRIPCMD -d "$OBJDIR2/$i" >> "$LOGFILE" 2>&1 || die
+	make "$i" "O=$OBJDIR2" >> "$LOGFILE" 2>&1 || die
 	mkdir -p "$TEMPDIR/orig/$(dirname $i)"
 	cp -f "$OBJDIR2/$i" "$TEMPDIR/orig/$i" || die
 done
@@ -388,8 +456,21 @@ for i in $FILES; do
 		KOBJFILE="$(readlink -f $KOBJFILE)"
 	fi
 	cd $TEMPDIR
-	"$TOOLSDIR"/create-diff-object "orig/$i" "patched/$i" "$KOBJFILE" "output/$i" 2>&1 |tee -a "$LOGFILE"
-	[[ "${PIPESTATUS[0]}" -eq 0 ]] || die
+	debugopt=
+	[[ $DEBUG -eq 1 ]] && debugopt=-d
+	"$TOOLSDIR"/create-diff-object $debugopt "orig/$i" "patched/$i" "$KOBJFILE" "output/$i" 2>&1 |tee -a "$LOGFILE"
+	rc="${PIPESTATUS[0]}"
+	if [[ $rc = 139 ]]; then
+		warn "create-diff-object SIGSEGV"
+		if ls core* &> /dev/null; then
+			cp core* /tmp
+			warn "core file at /tmp/$(ls core*)"
+		else
+			warn "no core file found, run 'ulimit -c unlimited' and try to recreate"
+		fi
+		exit 1
+	fi
+	[[ $rc -eq 0 ]] || die
 done
 
 echo -n "Patched objects:"
@@ -404,7 +485,6 @@ cd "$TEMPDIR/output"
 ld -r -o ../patch/output.o $FILES >> "$LOGFILE" 2>&1 || die
 cd "$TEMPDIR/patch"
 KPATCH_BUILD="$SRCDIR" KPATCH_NAME="$PATCHNAME" KBUILD_EXTRA_SYMBOLS="$SYMVERSFILE" make "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
-$STRIPCMD "kpatch-$PATCHNAME.ko" >> "$LOGFILE" 2>&1 || die
 
 cp -f "$TEMPDIR/patch/kpatch-$PATCHNAME.ko" "$BASE" || die
 
