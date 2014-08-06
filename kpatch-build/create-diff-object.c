@@ -100,6 +100,7 @@ struct section {
 	int index;
 	enum status status;
 	int include;
+	int ignore;
 	union {
 		struct { /* if (is_rela_section()) */
 			struct section *base;
@@ -318,10 +319,13 @@ void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 		rela->sym = find_symbol_by_index(&kelf->symbols, symndx);
 		if (!rela->sym)
 			ERROR("could not find rela entry symbol\n");
-		if (rela->sym->sec && (rela->sym->sec->sh.sh_flags & SHF_STRINGS)) {
+		if (rela->sym->sec &&
+		    ((rela->sym->sec->sh.sh_flags & SHF_STRINGS) ||
+		     !strncmp(rela->sym->name, ".rodata.__func__.", 17))) {
 			rela->string = rela->sym->sec->data->d_buf + rela->addend;
 			if (!rela->string)
-				ERROR("could not lookup rela string\n");
+				ERROR("could not lookup rela string for %s+%d",
+				      rela->sym->name, rela->addend);
 		}
 
 		if (skip)
@@ -400,6 +404,11 @@ int is_bundleable(struct symbol *sym)
 	if (sym->type == STT_OBJECT &&
 	   !strncmp(sym->sec->name, ".data.",6) &&
 	   !strcmp(sym->sec->name + 6, sym->name))
+		return 1;
+
+	if (sym->type == STT_OBJECT &&
+	   !strncmp(sym->sec->name, ".rodata.",8) &&
+	   !strcmp(sym->sec->name + 8, sym->name))
 		return 1;
 
 	if (sym->type == STT_OBJECT &&
@@ -568,9 +577,15 @@ void kpatch_compare_correlated_section(struct section *sec)
 	    sec1->sh.sh_flags != sec2->sh.sh_flags ||
 	    sec1->sh.sh_addr != sec2->sh.sh_addr ||
 	    sec1->sh.sh_addralign != sec2->sh.sh_addralign ||
-	    sec1->sh.sh_entsize != sec2->sh.sh_entsize ||
-	    sec1->sh.sh_link != sec1->sh.sh_link)
+	    sec1->sh.sh_entsize != sec2->sh.sh_entsize)
 		DIFF_FATAL("%s section header details differ", sec1->name);
+
+	/* Short circuit for mcount sections, we rebuild regardless */
+	if (!strcmp(sec->name, ".rela__mcount_loc") ||
+	    !strcmp(sec->name, "__mcount_loc")) {
+		sec->status = SAME;
+		goto out;
+	}
 
 	if (sec1->sh.sh_size != sec2->sh.sh_size ||
 	    sec1->data->d_size != sec2->data->d_size) {
@@ -614,10 +629,21 @@ void kpatch_compare_correlated_symbol(struct symbol *sym)
 
 	if (sym1->sym.st_info != sym2->sym.st_info ||
 	    sym1->sym.st_other != sym2->sym.st_other ||
-	    (sym1->sec && sym2->sec && sym1->sec->twin != sym2->sec) ||
 	    (sym1->sec && !sym2->sec) ||
 	    (sym2->sec && !sym1->sec))
 		DIFF_FATAL("symbol info mismatch: %s", sym1->name);
+
+	/*
+	 * If two symbols are correlated but their sections are not, then the
+	 * symbol has changed sections.  This is only allowed if the symbol is
+	 * moving out of an ignored section.
+	 */
+	if (sym1->sec && sym2->sec && sym1->sec->twin != sym2->sec) {
+		if (sym2->sec->twin && sym2->sec->twin->ignore)
+			sym->status = CHANGED;
+		else
+			DIFF_FATAL("symbol changed sections: %s", sym1->name);
+	}
 
 	if (sym1->type == STT_OBJECT &&
 	    sym1->sym.st_size != sym2->sym.st_size)
@@ -764,6 +790,118 @@ void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 	}
 }
 
+/*
+ * gcc renames static local variables by appending a period and a number.  For
+ * example, __key could be renamed to __key.31452.  Unfortunately this number
+ * can arbitrarily change.  Try to rename the patched version of the symbol to
+ * match the base version and then correlate them.
+ */
+void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
+					     struct kpatch_elf *patched)
+{
+	struct symbol *sym, *basesym;
+	struct section *tmpsec, *sec;
+	struct rela *rela;
+	int prefixlen;
+	char *dot;
+
+	list_for_each_entry(sym, &patched->symbols, list) {
+		if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL ||
+		    sym->twin)
+			continue;
+
+		/*
+		 * The static variables in the __verbose section contain
+		 * debugging information specific to the patched object and
+		 * shouldn't be correlated.
+		 */
+		if (!strcmp(sym->sec->name, "__verbose"))
+			continue;
+
+		dot = strchr(sym->name, '.');
+		if (!dot)
+			continue;
+		prefixlen = dot - sym->name;
+		if (sym->name[prefixlen+1] < '0' ||
+		    sym->name[prefixlen+1] > '9')
+			continue;
+
+		/*
+		 * __func__'s are special gcc static variables which contain
+		 * the function name.  There's no need to correlate them
+		 * because they're read-only and their comparison is done in
+		 * rela_equal() by comparing the literal strings.
+		 */
+		if (!strncmp(sym->name, "__func__", prefixlen))
+			continue;
+
+		/* find the patched function which uses the static variable */
+		sec = NULL;
+		list_for_each_entry(tmpsec, &patched->sections, list) {
+			if (!is_rela_section(tmpsec) ||
+			    is_debug_section(tmpsec))
+				continue;
+			list_for_each_entry(rela, &tmpsec->relas, list) {
+				if (rela->sym != sym)
+					continue;
+				if (sec)
+					ERROR("static local variable %s used by two functions",
+					      sym->name);
+				sec = tmpsec;
+				break;
+			}
+		}
+		if (!sec)
+			ERROR("static local variable %s not used", sym->name);
+
+		if (!sec->twin)
+			continue;
+
+		/*
+		 * Ensure there are no other orphaned static variables with the
+		 * same prefix in the function.  This is possible if the
+		 * variables are in different scopes (using C braces).
+		 */
+		list_for_each_entry(rela, &sec->relas, list) {
+			if (rela->sym == sym || rela->sym->twin)
+				continue;
+			if (!strncmp(rela->sym->name, sym->name, prefixlen))
+				ERROR("found another static local variable matching %s in patched %s",
+				      sym->name, sec->name);
+		}
+
+		/* find the base object's corresponding variable */
+		basesym = NULL;
+		list_for_each_entry(rela, &sec->twin->relas, list) {
+			if (rela->sym->twin)
+				continue;
+			if (strncmp(rela->sym->name, sym->name, prefixlen))
+				continue;
+			if (basesym)
+				ERROR("found two static local variables matching %s in orig %s",
+				      sym->name, sec->name);
+
+			basesym = rela->sym;
+		}
+		if (!basesym)
+			continue;
+
+		if (sym != sym->sec->sym)
+			ERROR("expected bundled section for %s", sym->name);
+		if (basesym != basesym->sec->sym)
+			ERROR("expected bundled section for %s",basesym->name);
+
+		log_debug("renaming and correlating %s to %s\n",
+			  sym->name, basesym->name);
+		sym->name = strdup(basesym->name);
+		sym->twin = basesym;
+		basesym->twin = sym;
+		sym->sec->twin = basesym->sec;
+		basesym->sec->twin = sym->sec;
+		sym->status = basesym->status = SAME;
+	}
+}
+
 void kpatch_correlate_elfs(struct kpatch_elf *kelf1, struct kpatch_elf *kelf2)
 {
 	kpatch_correlate_sections(&kelf1->sections, &kelf2->sections);
@@ -796,6 +934,13 @@ void rela_insn(struct section *sec, struct rela *rela, struct insn *insn)
 	}
 }
 
+/*
+ * Mangle the relas a little.  The compiler will sometimes use section symbols
+ * to reference local objects and functions rather than the object or function
+ * symbols themselves.  We substitute the object/function symbols for the
+ * section symbol in this case so that the relas can be properly correlated and
+ * so that the existing object/function in vmlinux can be linked to.
+ */
 void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 {
 	struct section *sec;
@@ -827,7 +972,9 @@ void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 			 */
 			if (strcmp(rela->sym->name, ".data..percpu") &&
 			    strcmp(rela->sym->name, ".data..read_mostly") &&
-			    strcmp(rela->sym->name, ".data.unlikely"))
+			    strcmp(rela->sym->name, ".data.unlikely") &&
+			    !(rela->sym->type == STT_SECTION && rela->sym->sec &&
+			      (rela->sym->sec->sh.sh_flags & SHF_EXECINSTR)))
 				continue;
 			list_for_each_entry(sym, &kelf->symbols, list) {
 
@@ -913,8 +1060,8 @@ void kpatch_verify_patchability(struct kpatch_elf *kelf)
 
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (sec->status == CHANGED && !sec->include) {
-			log_normal("%s: changed section %s not selected for inclusion\n",
-				   objname, sec->name);
+			log_normal("changed section %s not selected for inclusion\n",
+				   sec->name);
 			errs++;
 		}
 
@@ -922,8 +1069,8 @@ void kpatch_verify_patchability(struct kpatch_elf *kelf)
 		if (sec->include &&
 		    (!strncmp(sec->name, ".data", 5) ||
 		     !strncmp(sec->name, ".bss", 4))) {
-			log_normal("%s: data section %s selected for inclusion\n",
-				   objname, sec->name);
+			log_normal("data section %s selected for inclusion\n",
+				   sec->name);
 			errs++;
 		}
 	}
@@ -1134,6 +1281,9 @@ void kpatch_migrate_included_elements(struct kpatch_elf *kelf, struct kpatch_elf
 		list_del(&sec->list);
 		list_add_tail(&sec->list, &out->sections);
 		sec->index = 0;
+		if (!is_rela_section(sec) && sec->secsym && !sec->secsym->include)
+			/* break link to non-included section symbol */
+			sec->secsym = NULL;
 	}
 
 	/* migrate included symbols from kelf to out */
@@ -1370,6 +1520,89 @@ void kpatch_include_debug_sections(struct kpatch_elf *kelf)
 		list_for_each_entry_safe(rela, saferela, &sec->relas, list)
 			if (!rela->sym->sec->include)
 				list_del(&rela->list);
+	}
+}
+
+void kpatch_mark_ignored_sections(struct kpatch_elf *kelf)
+{
+	struct section *sec, *strsec, *ignoresec;
+	struct rela *rela;
+	char *name;
+
+	sec = find_section_by_name(&kelf->sections, ".kpatch.ignore.sections");
+	if (!sec)
+		return;
+
+	list_for_each_entry(rela, &sec->rela->relas, list) {
+		strsec = rela->sym->sec;
+		strsec->status = CHANGED;
+		/*
+		 * Include the string section here.  This is because the
+		 * KPATCH_IGNORE_SECTION() macro is passed a literal string
+		 * by the patch author, resulting in a change to the string
+		 * section.  If we don't include it, then we will potentially
+		 * get a "changed section not included" error in
+		 * kpatch_verify_patchability() if no other function based change
+		 * also changes the string section.  We could try to exclude each
+		 * literal string added to the section by KPATCH_IGNORE_SECTION()
+		 * from the section data comparison, but this is a simpler way.
+		 */
+		strsec->include = 1;
+		name = strsec->data->d_buf + rela->addend;
+		ignoresec = find_section_by_name(&kelf->sections, name);
+		if (!ignoresec)
+			ERROR("expected ignored section");
+		log_normal("ignoring section %s\n", name);
+		ignoresec->ignore = 1;
+		if (ignoresec->twin)
+			ignoresec->twin->ignore = 1;
+	}
+}
+
+void kpatch_mark_ignored_sections_same(struct kpatch_elf *kelf)
+{
+	struct section *sec;
+	struct symbol *sym;
+
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (!sec->ignore)
+			continue;
+		sec->status = SAME;
+		if (sec->secsym)
+			sec->secsym->status = SAME;
+		if (sec->rela)
+			sec->rela->status = SAME;
+		list_for_each_entry(sym, &kelf->symbols, list) {
+			if (sym->sec != sec)
+				continue;
+			sym->status = SAME;
+		}
+	}
+}
+
+void kpatch_mark_ignored_functions_same(struct kpatch_elf *kelf)
+{
+	struct section *sec;
+	struct rela *rela;
+
+	sec = find_section_by_name(&kelf->sections, ".kpatch.ignore.functions");
+	if (!sec)
+		return;
+
+	list_for_each_entry(rela, &sec->rela->relas, list) {
+		if (!rela->sym->sec)
+			ERROR("expected bundled symbol");
+		if (rela->sym->type != STT_FUNC)
+			ERROR("expected function symbol");
+		log_normal("ignoring function %s\n", rela->sym->name);
+		if (rela->sym->status != CHANGED)
+			log_normal("NOTICE: no change detected in function %s, unnecessary KPATCH_IGNORE_FUNCTION()?\n", rela->sym->name);
+		rela->sym->status = SAME;
+		rela->sym->sec->status = SAME;
+		if (rela->sym->sec->secsym)
+			rela->sym->sec->secsym->status = SAME;
+		if (rela->sym->sec->rela)
+			rela->sym->sec->rela->status = SAME;
 	}
 }
 
@@ -2282,27 +2515,25 @@ int main(int argc, char *argv[])
 	kpatch_check_program_headers(kelf_base->elf);
 	kpatch_check_program_headers(kelf_patched->elf);
 
+	kpatch_replace_sections_syms(kelf_base);
+	kpatch_replace_sections_syms(kelf_patched);
 	kpatch_rename_mangled_functions(kelf_base, kelf_patched);
 
 	kpatch_correlate_elfs(kelf_base, kelf_patched);
+	kpatch_correlate_static_local_variables(kelf_base, kelf_patched);
+
 	/*
 	 * After this point, we don't care about kelf_base anymore.
 	 * We access its sections via the twin pointers in the
 	 * section, symbol, and rela lists of kelf_patched.
 	 */
+	kpatch_mark_ignored_sections(kelf_patched);
 	kpatch_compare_correlated_elements(kelf_patched);
 	kpatch_elf_teardown(kelf_base);
 	kpatch_elf_free(kelf_base);
 
-	/*
-	 * Mangle the relas a little.  The compiler will sometimes
-	 * use section symbols to reference local objects and functions
-	 * rather than the object or function symbols themselves.
-	 * We substitute the object/function symbols for the section
-	 * symbol in this case so that the existing object/function
-	 * in vmlinux can be linked to.
-	 */
-	kpatch_replace_sections_syms(kelf_patched);
+	kpatch_mark_ignored_functions_same(kelf_patched);
+	kpatch_mark_ignored_sections_same(kelf_patched);
 
 	kpatch_process_special_sections(kelf_patched);
 

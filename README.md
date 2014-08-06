@@ -18,6 +18,11 @@ Here's a video of kpatch in action:
 
 [![kpatch video](http://img.youtube.com/vi/juyQ5TsJRTA/0.jpg)](http://www.youtube.com/watch?v=juyQ5TsJRTA)
 
+And a few more:
+
+- https://www.youtube.com/watch?v=rN0sFjrJQfU
+- https://www.youtube.com/watch?v=Mftc80KyjA4
+
 Installation
 ------------
 
@@ -30,17 +35,47 @@ Installation
 
 Install the dependencies for compiling kpatch:
 
-    sudo yum install gcc kernel-devel elfutils elfutils-devel
+```bash
+sudo yum install gcc kernel-devel elfutils elfutils-devel
+```
 
 Install the dependencies for the "kpatch-build" command:
 
-    sudo yum install rpmdevtools pesign yum-utils
-    sudo yum-builddep kernel
-    sudo debuginfo-install kernel
+```bash
+sudo yum install rpmdevtools pesign yum-utils
+sudo yum-builddep kernel
+sudo debuginfo-install kernel
 
-    # optional, but highly recommended
-    sudo yum install ccache
-    ccache --max-size=5G
+# optional, but highly recommended
+sudo yum install ccache
+ccache --max-size=5G
+```
+
+####RHEL 7
+
+*NOTE: You'll need about 15GB of free disk space for the kpatch-build cache in
+`~/.kpatch` and for ccache.*
+
+Install the dependencies for compiling kpatch:
+
+```bash
+sudo yum install gcc kernel-devel elfutils elfutils-devel
+```
+
+Install the dependencies for the "kpatch-build" command:
+
+```bash
+sudo yum install rpmdevtools pesign yum-utils zlib-devel \
+  binutils-devel newt-devel python-devel perl-ExtUtils-Embed \
+  audit-libs devel numactl-devel pciutils-devel bison
+
+sudo yum-builddep kernel
+sudo debuginfo-install kernel
+
+# optional, but highly recommended
+sudo yum install ccache
+ccache --max-size=5G
+```
 
 ####Ubuntu 14.04
 
@@ -49,16 +84,20 @@ Install the dependencies for the "kpatch-build" command:
 
 Install the dependencies for compiling kpatch:
 
-    apt-get install make gcc libelf-dev
+```bash
+apt-get install make gcc libelf-dev
+```
 
 Install the dependencies for the "kpatch-build" command:
 
-    apt-get install dpkg-dev
-    apt-get build-dep linux
+```bash
+apt-get install dpkg-dev
+apt-get build-dep linux
 
-    # optional, but highly recommended
-    apt-get install ccache
-    ccache --max-size=5G
+# optional, but highly recommended
+apt-get install ccache
+ccache --max-size=5G
+```
 
 Install kernel debug symbols:
 
@@ -88,12 +127,14 @@ Install the dependencies for compiling kpatch:
 
 Install and prepare the kernel sources:
 
-    apt-get install linux-source-$(uname -r)
-    cd /usr/src && tar xvf linux-source-$(uname -r).tar.xz && ln -s linux-source-$(uname -r) linux && cd linux
-    cp /boot/config-$(uname -r) .config
-    for OPTION in CONFIG_KALLSYMS_ALL CONFIG_FUNCTION_TRACER ; do sed -i "s/# $OPTION is not set/$OPTION=y/g" .config ; done
-    sed -i "s/^SUBLEVEL.*/SUBLEVEL =/" Makefile
-    make -j`getconf _NPROCESSORS_CONF` deb-pkg KDEB_PKGVERSION=$(uname -r).9-1
+```bash
+apt-get install linux-source-$(uname -r)
+cd /usr/src && tar xvf linux-source-$(uname -r).tar.xz && ln -s linux-source-$(uname -r) linux && cd linux
+cp /boot/config-$(uname -r) .config
+for OPTION in CONFIG_KALLSYMS_ALL CONFIG_FUNCTION_TRACER ; do sed -i "s/# $OPTION is not set/$OPTION=y/g" .config ; done
+sed -i "s/^SUBLEVEL.*/SUBLEVEL =/" Makefile
+make -j`getconf _NPROCESSORS_CONF` deb-pkg KDEB_PKGVERSION=$(uname -r).9-1
+```
 
 Install the kernel packages and reboot
 
@@ -109,6 +150,41 @@ Install the dependencies for the "kpatch-build" command:
     apt-get install ccache
     ccache --max-size=5G
 
+####Debian 7.x
+
+*NOTE: You'll need about 15GB of free disk space for the kpatch-build cache in
+`~/.kpatch` and for ccache.*
+
+Add backports repositories:
+
+```bash
+echo "deb http://http.debian.net/debian wheezy-backports main" > /etc/apt/sources.list.d/wheezy-backports.list
+echo "deb http://packages.incloudus.com backports-incloudus main" > /etc/apt/sources.list.d/incloudus.list
+wget http://packages.incloudus.com/incloudus/incloudus.pub -O- | apt-key add -
+aptitude update
+```
+
+Install the linux kernel, symbols and gcc 4.9:
+
+    aptitude install -t wheezy-backports -y initramfs-tools
+    aptitude install -y gcc gcc-4.9 linux-image-3.14 linux-image-3.14-dbg
+
+Configure gcc 4.9 as the default gcc compiler:
+
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.7 20
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.9 50
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-4.7 20
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-4.9 50
+
+Install kpatch and these dependencies:
+
+    aptitude install kpatch
+
+Configure ccache (installed by kpatch package):
+
+    ccache --max-size=5G
+
+
 ###Build
 
 Compile kpatch:
@@ -117,7 +193,7 @@ Compile kpatch:
 
 ###Install
 
-OPTIONAL: Install kpatch to /usr/local:
+OPTIONAL: Install kpatch to `/usr/local`:
 
     sudo make install
 
@@ -128,9 +204,9 @@ git tree.
 Quick start
 -----------
 
-*NOTE: While kpatch is designed to work with any recent Linux
-kernel on any distribution, the "kpatch-build" command currently only works on
-Fedora 20 and Ubuntu 14.04.*
+> NOTE: While kpatch is designed to work with any recent Linux
+kernel on any distribution, the `kpatch-build` command has **ONLY** been tested
+and confirmed to work on Fedora 20, RHEL 7 and Ubuntu 14.04.
 
 First, make a source code patch against the kernel tree using diff, git, or
 quilt.
@@ -387,7 +463,7 @@ We do have plans to implement something like that.
 
 **Q. What kernels are supported?**
 
-kpatch needs gcc >= 4.8 and Linux >= 3.7 for use of the -mfentry flag.
+kpatch needs gcc >= 4.8 and Linux >= 3.9.
 
 **Q. Is it possible to remove a patch?**
 

@@ -26,6 +26,9 @@ load <module>
 replace <module>
        load patch module into the running kernel, replacing all other modules
 
+unload --all
+       unload all patch modules from the running kernel
+
 unload <module>
        unload patch module from the running kernel
 
@@ -34,6 +37,9 @@ info <module>
 
 list
        list installed patch modules
+
+version
+       display the kpatch version
 
 .SH SEE ALSO
 kpatch-build(1)
