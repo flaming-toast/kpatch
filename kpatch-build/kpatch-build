@@ -94,7 +94,7 @@ find_dirs() {
 		# installation path
 		TOOLSDIR="$(readlink -f $SCRIPTDIR/../libexec/kpatch)"
 		DATADIR="$(readlink -f $SCRIPTDIR/../share/kpatch)"
-		SYMVERSFILE="$(readlink -f $SCRIPTDIR/../lib/modules/$(uname -r)/extra/kpatch/Module.symvers)"
+		SYMVERSFILE="$(readlink -f $SCRIPTDIR/../lib/kpatch/$(uname -r)/Module.symvers)"
 		return
 	fi
 
@@ -392,46 +392,23 @@ export KCFLAGS="-I$DATADIR/patch -ffunction-sections -fdata-sections"
 
 echo "Building original kernel"
 make mrproper >> "$LOGFILE" 2>&1 || die
-make "-j$CPUS" $TARGETS "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
+CROSS_COMPILE="$TOOLSDIR/kpatch-gcc " make "-j$CPUS" $TARGETS "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
 
 echo "Building patched kernel"
 patch -N -p1 < "$APPLIEDPATCHFILE" >> "$LOGFILE" 2>&1 || die
-make "-j$CPUS" $TARGETS "O=$OBJDIR" 2>&1 | tee -a "$TEMPDIR/patched_build.log" >> "$LOGFILE"
+mkdir -p "$TEMPDIR/orig" "$TEMPDIR/patched"
+export TEMPDIR
+CROSS_COMPILE="$TOOLSDIR/kpatch-gcc " make "-j$CPUS" $TARGETS "O=$OBJDIR"  >> "$LOGFILE" 2>&1 || die
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || die
 
-echo "Detecting changed objects"
-while read line; do
-	[[ "$line" =~ CC ]] || continue
-	eval set -- "$line"
-	case $2 in
-		init/version.o) continue ;;
-		scripts/mod/devicetable-offsets.s) continue ;;
-		scripts/mod/file2alias.o) continue ;;
-		*.mod.o) continue ;;
-		arch/x86/kernel/asm-offsets.s) die "a struct definition change was detected" ;;
-		\[M\]) obj=$3 ;;
-		*) obj=$2 ;;
-	esac
+if [[ ! -e "$TEMPDIR/changed_objs" ]]; then
+	die "no changed objects found"
+fi
 
-	echo $obj >> $TEMPDIR/changed_objs
-done < "$TEMPDIR/patched_build.log"
-
-[[ ! -s "$TEMPDIR/changed_objs" ]] && die "no changed objects were detected"
-
-mkdir "$TEMPDIR/patched"
-for i in $(cat $TEMPDIR/changed_objs); do
-	mkdir -p "$TEMPDIR/patched/$(dirname $i)"
+for i in $(cat "$TEMPDIR/changed_objs")
+do
+	mkdir -p "$TEMPDIR/patched/$(dirname $i)" || die
 	cp -f "$OBJDIR/$i" "$TEMPDIR/patched/$i" || die
-done
-
-echo "Rebuilding original objects"
-patch -R -p1 < "$APPLIEDPATCHFILE" >> "$LOGFILE" 2>&1
-rm -f "$APPLIEDPATCHFILE"
-make "-j$CPUS" $TARGETS "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
-mkdir "$TEMPDIR/orig"
-for i in $(cat $TEMPDIR/changed_objs); do
-	mkdir -p "$TEMPDIR/orig/$(dirname $i)"
-	cp -f "$OBJDIR/$i" "$TEMPDIR/orig/$i" || die
 done
 
 echo "Extracting new and modified ELF sections"
@@ -440,11 +417,11 @@ FILES="$(find * -type f)"
 cd "$TEMPDIR"
 mkdir output
 declare -A objnames
+CHANGED=0
 for i in $FILES; do
 	mkdir -p "output/$(dirname $i)"
 	cd "$OBJDIR"
 	find_kobj $i
-	objnames[$KOBJFILE]=1
 	if [[ $KOBJFILE = vmlinux ]]; then
 		KOBJFILE=$VMLINUX
 	else
@@ -465,8 +442,17 @@ for i in $FILES; do
 		fi
 		exit 1
 	fi
-	[[ $rc -eq 0 ]] || die
+	# create-diff-object returns 3 if no functional change is found
+	[[ $rc -eq 0 ]] || [[ $rc -eq 3 ]] || die
+	if [[ $rc -eq 0 ]]; then
+		CHANGED=1
+		objnames[$KOBJFILE]=1
+	fi
 done
+
+if [[ $CHANGED -eq 0 ]]; then
+	die "no functional changes found"
+fi
 
 echo -n "Patched objects:"
 for i in "${!objnames[@]}"; do echo -n " $(basename $i)"; done
@@ -477,7 +463,7 @@ cp "$OBJDIR/.config" "$SRCDIR"
 cd "$SRCDIR"
 make prepare >> "$LOGFILE" 2>&1 || die
 cd "$TEMPDIR/output"
-ld -r -o ../patch/output.o $FILES >> "$LOGFILE" 2>&1 || die
+ld -r -o ../patch/output.o $(find . -name "*.o") >> "$LOGFILE" 2>&1 || die
 cd "$TEMPDIR/patch"
 KPATCH_BUILD="$SRCDIR" KPATCH_NAME="$PATCHNAME" KBUILD_EXTRA_SYMBOLS="$SYMVERSFILE" make "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
 
