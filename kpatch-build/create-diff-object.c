@@ -1122,7 +1122,7 @@ void kpatch_verify_patchability(struct kpatch_elf *kelf)
 		}
 
 		/* ensure we aren't including .data.* or .bss.* */
-		if (sec->include &&
+		if (sec->include && sec->status != NEW &&
 		    (!strncmp(sec->name, ".data", 5) ||
 		     !strncmp(sec->name, ".bss", 4))) {
 			log_normal("data section %s selected for inclusion\n",
@@ -1179,20 +1179,25 @@ void kpatch_include_standard_elements(struct kpatch_elf *kelf)
 	list_for_each_entry(sec, &kelf->sections, list) {
 		/* include these sections even if they haven't changed */
 		if (!strcmp(sec->name, ".shstrtab") ||
-		     !strcmp(sec->name, ".strtab") ||
-		     !strcmp(sec->name, ".symtab"))
+		    !strcmp(sec->name, ".strtab") ||
+		    !strcmp(sec->name, ".symtab") ||
+		    !strncmp(sec->name, ".rodata.str1.", 13)) {
 			sec->include = 1;
+			if (sec->secsym)
+				sec->secsym->include = 1;
+		}
 	}
 
 	/* include the NULL symbol */
 	list_entry(kelf->symbols.next, struct symbol, list)->include = 1;
 }
 
-void kpatch_include_hook_elements(struct kpatch_elf *kelf)
+int kpatch_include_hook_elements(struct kpatch_elf *kelf)
 {
 	struct section *sec;
 	struct symbol *sym;
 	struct rela *rela;
+	int found = 0;
 
 	/* include load/unload sections */
 	list_for_each_entry(sec, &kelf->sections, list) {
@@ -1201,6 +1206,7 @@ void kpatch_include_hook_elements(struct kpatch_elf *kelf)
 		    !strcmp(sec->name, ".rela.kpatch.hooks.load") ||
 		    !strcmp(sec->name, ".rela.kpatch.hooks.unload")) {
 			sec->include = 1;
+			found = 1;
 			if (is_rela_section(sec)) {
 				/* include hook dependencies */
 				rela = list_entry(sec->relas.next,
@@ -1210,6 +1216,7 @@ void kpatch_include_hook_elements(struct kpatch_elf *kelf)
 				kpatch_include_symbol(sym, 0);
 				/* strip the hook symbol */
 				sym->include = 0;
+				sym->sec->sym = NULL;
 				/* use section symbol instead */
 				rela->sym = sym->sec->secsym;
 			} else {
@@ -1226,6 +1233,8 @@ void kpatch_include_hook_elements(struct kpatch_elf *kelf)
 		if (!strcmp(sym->name, "kpatch_load_data") ||
 		    !strcmp(sym->name, "kpatch_unload_data"))
 			sym->include = 0;
+
+	return found;
 }
 
 void kpatch_include_force_elements(struct kpatch_elf *kelf)
@@ -1983,7 +1992,7 @@ void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 			          sym->name, result.value, result.size);
 
 			/* add entry in text section */
-			funcs[index].old_offset = result.value;
+			funcs[index].old_addr = result.value;
 			funcs[index].old_size = result.size;
 			funcs[index].new_size = sym->sym.st_size;
 
@@ -2168,10 +2177,10 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 			dynrela->offset = index * sizeof(*dynrelas) +
 				offsetof(struct kpatch_patch_dynrela, objname);
 
+			rela->sym->strip = 1;
 			list_del(&rela->list);
 			free(rela);
 
-			rela->sym->strip = 1;
 			index++;
 		}
 	}
@@ -2549,7 +2558,7 @@ int main(int argc, char *argv[])
 {
 	struct kpatch_elf *kelf_base, *kelf_patched, *kelf_out;
 	struct arguments arguments;
-	int num_changed;
+	int num_changed, hooks_exist;
 	struct lookup_table *lookup;
 	struct section *sec, *symtab;
 	struct symbol *sym;
@@ -2597,14 +2606,18 @@ int main(int argc, char *argv[])
 	kpatch_include_standard_elements(kelf_patched);
 	num_changed = kpatch_include_changed_functions(kelf_patched);
 	kpatch_include_debug_sections(kelf_patched);
-	kpatch_include_hook_elements(kelf_patched);
+	hooks_exist = kpatch_include_hook_elements(kelf_patched);
 	kpatch_include_force_elements(kelf_patched);
 	kpatch_dump_kelf(kelf_patched);
 	kpatch_verify_patchability(kelf_patched);
 
 	if (!num_changed) {
-		log_normal("no changed functions were found\n");
-		return 3; /* 1 is ERROR, 2 is DIFF_FATAL */
+		if (hooks_exist)
+			log_normal("no changed functions were found, but hooks exist\n");
+		else {
+			log_normal("no changed functions were found\n");
+			return 3; /* 1 is ERROR, 2 is DIFF_FATAL */
+		}
 	}
 
 	/* this is destructive to kelf_patched */
