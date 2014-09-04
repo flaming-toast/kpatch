@@ -798,7 +798,8 @@ void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 				     struct kpatch_elf *patched)
 {
 	struct symbol *sym, *basesym;
-	char *prefix, *dot;
+	char *prefix, *dot, name[256], *origname;
+	struct section *sec, *basesec;
 
 	list_for_each_entry(sym, &patched->symbols, list) {
 		if (sym->type != STT_FUNC)
@@ -824,6 +825,7 @@ void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 			continue;
 
 		log_debug("renaming %s to %s\n", sym->name, basesym->name);
+		origname = sym->name;
 		sym->name = strdup(basesym->name);
 
 		if (sym != sym->sec->sym)
@@ -832,6 +834,24 @@ void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 		sym->sec->name = strdup(basesym->sec->name);
 		if (sym->sec->rela)
 			sym->sec->rela->name = strdup(basesym->sec->rela->name);
+
+		/*
+		 * When function foo.isra.1 has a switch statement, it might
+		 * have a corresponding bundled .rodata.foo.isra.1 section (in
+		 * addition to .text.foo.isra.1 which we renamed above).
+		 */
+		sprintf(name, ".rodata.%s", origname);
+		sec = find_section_by_name(&patched->sections, name);
+		if (!sec)
+			continue;
+		sprintf(name, ".rodata.%s", basesym->name);
+		basesec = find_section_by_name(&base->sections, name);
+		if (!basesec)
+			continue;
+		sec->name = strdup(basesec->name);
+		sec->secsym->name = sec->name;
+		if (sec->rela)
+			sec->rela->name = strdup(basesec->rela->name);
 	}
 }
 
@@ -847,7 +867,7 @@ void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 	struct symbol *sym, *basesym;
 	struct section *tmpsec, *sec;
 	struct rela *rela;
-	int prefixlen;
+	int prefixlen, bundled, basebundled;
 	char *dot;
 
 	list_for_each_entry(sym, &patched->symbols, list) {
@@ -922,7 +942,7 @@ void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 				continue;
 			if (strncmp(rela->sym->name, sym->name, prefixlen))
 				continue;
-			if (basesym)
+			if (basesym && basesym != rela->sym)
 				ERROR("found two static local variables matching %s in orig %s",
 				      sym->name, sec->name);
 
@@ -931,19 +951,25 @@ void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 		if (!basesym)
 			continue;
 
-		if (sym != sym->sec->sym)
-			ERROR("expected bundled section for %s", sym->name);
-		if (basesym != basesym->sec->sym)
-			ERROR("expected bundled section for %s",basesym->name);
+		bundled = sym == sym->sec->sym;
+		basebundled = basesym == basesym->sec->sym;
+		if (bundled != basebundled)
+			ERROR("bundle mismatch for symbol %s", sym->name);
+		if (!bundled && sym->sec->twin != basesym->sec)
+			ERROR("sections %s and %s aren't correlated",
+			      sym->sec->name, basesym->sec->name);
 
 		log_debug("renaming and correlating %s to %s\n",
 			  sym->name, basesym->name);
 		sym->name = strdup(basesym->name);
 		sym->twin = basesym;
 		basesym->twin = sym;
-		sym->sec->twin = basesym->sec;
-		basesym->sec->twin = sym->sec;
 		sym->status = basesym->status = SAME;
+
+		if (bundled) {
+			sym->sec->twin = basesym->sec;
+			basesym->sec->twin = sym->sec;
+		}
 	}
 }
 
@@ -1265,6 +1291,22 @@ void kpatch_include_force_elements(struct kpatch_elf *kelf)
 		if (!strncmp(sym->name, "__kpatch_force_func_",
 		            strlen("__kpatch_force_func_")))
 			sym->include = 0;
+}
+
+int kpatch_include_new_globals(struct kpatch_elf *kelf)
+{
+	struct symbol *sym;
+	int nr = 0;
+
+	list_for_each_entry(sym, &kelf->symbols, list) {
+		if (sym->bind == STB_GLOBAL && sym->sec &&
+		    sym->status == NEW) {
+			kpatch_include_symbol(sym, 0);
+			nr++;
+		}
+	}
+
+	return nr;
 }
 
 int kpatch_include_changed_functions(struct kpatch_elf *kelf)
@@ -1616,8 +1658,8 @@ void kpatch_mark_ignored_sections(struct kpatch_elf *kelf)
 		name = strsec->data->d_buf + rela->addend;
 		ignoresec = find_section_by_name(&kelf->sections, name);
 		if (!ignoresec)
-			ERROR("expected ignored section");
-		log_normal("ignoring section %s\n", name);
+			ERROR("KPATCH_IGNORE_SECTION: can't find %s", name);
+		log_normal("ignoring section: %s\n", name);
 		ignoresec->ignore = 1;
 		if (ignoresec->twin)
 			ignoresec->twin->ignore = 1;
@@ -1659,7 +1701,7 @@ void kpatch_mark_ignored_functions_same(struct kpatch_elf *kelf)
 			ERROR("expected bundled symbol");
 		if (rela->sym->type != STT_FUNC)
 			ERROR("expected function symbol");
-		log_normal("ignoring function %s\n", rela->sym->name);
+		log_normal("ignoring function: %s\n", rela->sym->name);
 		if (rela->sym->status != CHANGED)
 			log_normal("NOTICE: no change detected in function %s, unnecessary KPATCH_IGNORE_FUNCTION()?\n", rela->sym->name);
 		rela->sym->status = SAME;
@@ -2044,7 +2086,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
                                          char *objname)
 {
 	int nr, index, objname_offset;
-	struct section *sec, *sec2, *relasec;
+	struct section *sec, *dynsec, *relasec;
 	struct rela *rela, *dynrela, *safe;
 	struct symbol *strsym;
 	struct lookup_result result;
@@ -2065,9 +2107,9 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 	}
 
 	/* create text/rela section pair */
-	sec = create_section_pair(kelf, ".kpatch.dynrelas", sizeof(*dynrelas), nr);
-	relasec = sec->rela;
-	dynrelas = sec->data->d_buf;
+	dynsec = create_section_pair(kelf, ".kpatch.dynrelas", sizeof(*dynrelas), nr);
+	relasec = dynsec->rela;
+	dynrelas = dynsec->data->d_buf;
 
 	/* lookup strings symbol */
 	strsym = find_symbol_by_name(&kelf->symbols, ".kpatch.strings");
@@ -2079,13 +2121,13 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 
 	/* populate sections */
 	index = 0;
-	list_for_each_entry(sec2, &kelf->sections, list) {
-		if (!is_rela_section(sec2))
+	list_for_each_entry(sec, &kelf->sections, list) {
+		if (!is_rela_section(sec))
 			continue;
-		if (!strcmp(sec2->name, ".rela.kpatch.patches") ||
-		    !strcmp(sec2->name, ".rela.kpatch.dynrelas"))
+		if (!strcmp(sec->name, ".rela.kpatch.patches") ||
+		    !strcmp(sec->name, ".rela.kpatch.dynrelas"))
 			continue;
-		list_for_each_entry_safe(rela, safe, &sec2->relas, list) {
+		list_for_each_entry_safe(rela, safe, &sec->relas, list) {
 			if (rela->sym->sec)
 				continue;
 
@@ -2096,7 +2138,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 				if (lookup_local_symbol(table, rela->sym->name,
 				                        hint, &result))
 					ERROR("lookup_local_symbol %s (%s) needed for %s",
-			               rela->sym->name, hint, sec2->base->name);
+			               rela->sym->name, hint, sec->base->name);
 			}
 			else if (vmlinux) {
 				/*
@@ -2106,11 +2148,15 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 				 */
 				if (lookup_is_exported_symbol(table, rela->sym->name))
 					continue;
+
+				/*
+				 * If lookup_global_symbol() fails, assume the
+				 * symbol is defined in another object in the
+				 * patch module.
+				 */
 				if (lookup_global_symbol(table, rela->sym->name,
 							 &result))
-					ERROR("lookup_global_symbol failed for %s, needed for %s\n",
-					      rela->sym->name,
-					      sec2->base->name);
+					continue;
 			} else {
 				/*
 				 * We have a patch to a module which references
@@ -2154,10 +2200,10 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 
 			/* add rela to fill in dest field */
 			ALLOC_LINK(dynrela, &relasec->relas);
-			if (sec2->base->sym)
-				dynrela->sym = sec2->base->sym;
+			if (sec->base->sym)
+				dynrela->sym = sec->base->sym;
 			else
-				dynrela->sym = sec2->base->secsym;
+				dynrela->sym = sec->base->secsym;
 			dynrela->type = R_X86_64_64;
 			dynrela->addend = rela->offset;
 			dynrela->offset = index * sizeof(*dynrelas);
@@ -2186,8 +2232,8 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 	}
 
 	/* set size to actual number of dynrelas */
-	sec->data->d_size = index * sizeof(struct kpatch_patch_dynrela);
-	sec->sh.sh_size = sec->data->d_size;
+	dynsec->data->d_size = index * sizeof(struct kpatch_patch_dynrela);
+	dynsec->sh.sh_size = dynsec->data->d_size;
 }
 
 void kpatch_create_hooks_objname_rela(struct kpatch_elf *kelf, char *objname)
@@ -2558,7 +2604,7 @@ int main(int argc, char *argv[])
 {
 	struct kpatch_elf *kelf_base, *kelf_patched, *kelf_out;
 	struct arguments arguments;
-	int num_changed, hooks_exist;
+	int num_changed, hooks_exist, new_globals_exist;
 	struct lookup_table *lookup;
 	struct section *sec, *symtab;
 	struct symbol *sym;
@@ -2608,12 +2654,13 @@ int main(int argc, char *argv[])
 	kpatch_include_debug_sections(kelf_patched);
 	hooks_exist = kpatch_include_hook_elements(kelf_patched);
 	kpatch_include_force_elements(kelf_patched);
+	new_globals_exist = kpatch_include_new_globals(kelf_patched);
 	kpatch_dump_kelf(kelf_patched);
 	kpatch_verify_patchability(kelf_patched);
 
 	if (!num_changed) {
-		if (hooks_exist)
-			log_normal("no changed functions were found, but hooks exist\n");
+		if (hooks_exist || new_globals_exist)
+			log_normal("no changed functions were found, but hooks or new globals exist\n");
 		else {
 			log_normal("no changed functions were found\n");
 			return 3; /* 1 is ERROR, 2 is DIFF_FATAL */
