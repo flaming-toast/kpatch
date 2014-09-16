@@ -55,10 +55,13 @@ warn() {
 
 die() {
 	if [[ -z $1 ]]; then
-		warn "kpatch build failed. Check $LOGFILE for more details."
+		msg="kpatch build failed"
 	else
-		warn "$1"
+		msg="$1"
 	fi
+
+	warn "$msg. Check $LOGFILE for more details."
+
 	exit 1
 }
 
@@ -126,15 +129,23 @@ find_parent_obj() {
 	grepname=${1%.o}
 	grepname=$grepname\\\.o
 	if [[ $DEEP_FIND -eq 1 ]]; then
-		parent=$(find . -name ".*.cmd" | xargs grep -l $grepname | grep -v $dir/.${file}.cmd)
-		num=$(find . -name ".*.cmd" | xargs grep -l $grepname | grep -v $dir/.${file}.cmd | wc -l)
+		num=0
+		if [[ -n $last_deep_find ]]; then
+			parent=$(grep -l $grepname $last_deep_find/.*.cmd | grep -v $dir/.${file}.cmd |head -n1)
+			num=$(grep -l $grepname $last_deep_find/.*.cmd | grep -v $dir/.${file}.cmd |wc -l)
+		fi
+		if [[ $num -eq 0 ]]; then
+			parent=$(find * -name ".*.cmd" | xargs grep -l $grepname | grep -v $dir/.${file}.cmd |head -n1)
+			num=$(find * -name ".*.cmd" | xargs grep -l $grepname | grep -v $dir/.${file}.cmd | wc -l)
+			[[ $num -eq 1 ]] && last_deep_find=$(dirname $parent)
+		fi
 	else
-		parent=$(grep -l $grepname $dir/.*.cmd | grep -v $dir/.${file}.cmd)
+		parent=$(grep -l $grepname $dir/.*.cmd | grep -v $dir/.${file}.cmd |head -n1)
 		num=$(grep -l $grepname $dir/.*.cmd | grep -v $dir/.${file}.cmd | wc -l)
 	fi
 
 	[[ $num -eq 0 ]] && PARENT="" && return
-	[[ $num -gt 1 ]] && die "two parent matches for $1"
+	[[ $num -gt 1 ]] && ERROR_IF_DIFF="two parent matches for $1"
 
 	dir=$(dirname $parent)
 	PARENT=$(basename $parent)
@@ -147,14 +158,21 @@ find_parent_obj() {
 find_kobj() {
 	arg=$1
 	KOBJFILE=$arg
-	dir=$(dirname $KOBJFILE)
-	file=$(basename $KOBJFILE)
 	DEEP_FIND=0
+	ERROR_IF_DIFF=
 	while true; do
 		find_parent_obj $KOBJFILE
+		[[ -n $PARENT ]] && DEEP_FIND=0
 		if [[ -z $PARENT ]]; then
-			[[ $KOBJFILE = *built-in.o ]] && KOBJFILE=vmlinux && return
 			[[ $KOBJFILE = *.ko ]] && return
+			case $KOBJFILE in
+				*/built-in.o|\
+				arch/x86/lib/lib.a|\
+				arch/x86/kernel/head*.o|\
+				lib/lib.a)
+					KOBJFILE=vmlinux
+					return
+			esac
 			if [[ $DEEP_FIND -eq 0 ]]; then
 				DEEP_FIND=1
 				continue;
@@ -235,6 +253,12 @@ done
 TEMPDIR="$(mktemp -d /tmp/kpatch-build-XXXXXX)" || die "mktemp failed"
 trap cleanup EXIT INT TERM
 
+KVER=${ARCHVERSION%%-*}
+if [[ $ARCHVERSION =~ - ]]; then
+	KREL=${ARCHVERSION##*-}
+	KREL=${KREL%.*}
+fi
+
 if [[ -n $USERSRCDIR ]]; then
 	# save .config and vmlinux since they'll get removed with mrproper so
 	# we can restore them later and be able to run kpatch-build multiple
@@ -295,12 +319,6 @@ if [[ -n "$USERSRCDIR" ]]; then
 
 	cp -f "$CONFIGFILE" "$OBJDIR/.config"
 
-	echo "Detecting kernel version"
-	cd "$SRCDIR"
-	make mrproper >> "$LOGFILE" 2>&1 || die "make mrproper failed"
-	make O="$OBJDIR" prepare >> "$LOGFILE" 2>&1 || die "make prepare failed"
-	ARCHVERSION=$(make O="$OBJDIR" kernelrelease) || die "make kernelrelease failed"
-
 elif [[ -e "$SRCDIR" ]] && [[ -e "$VERSIONFILE" ]] && [[ $(cat "$VERSIONFILE") = $ARCHVERSION ]]; then
 	echo "Using cache at $SRCDIR"
 
@@ -310,12 +328,15 @@ else
 		echo "Fedora/Red Hat distribution detected"
 		rpm -q --quiet rpmdevtools || die "rpmdevtools not installed"
 
+		echo "Downloading kernel source for $ARCHVERSION"
 		if [[ -z "$SRCRPM" ]]; then
-			rpm -q --quiet yum-utils || die "yum-utils not installed"
-
-			echo "Downloading kernel source for $ARCHVERSION"
-			yumdownloader --source --destdir "$TEMPDIR" "kernel-$ARCHVERSION" >> "$LOGFILE" 2>&1 || die
-			SRCRPM="$TEMPDIR/kernel-${ARCHVERSION%*.*}.src.rpm"
+			if [[ $DISTRO = fedora ]]; then
+				wget -P $TEMPDIR http://kojipkgs.fedoraproject.org/packages/kernel/$KVER/$KREL/src/kernel-$KVER-$KREL.src.rpm >> "$LOGFILE" 2>&1 || die
+			else
+				rpm -q --quiet yum-utils || die "yum-utils not installed"
+				yumdownloader --source --destdir "$TEMPDIR" "kernel-$ARCHVERSION" >> "$LOGFILE" 2>&1 || die
+			fi
+			SRCRPM="$TEMPDIR/kernel-$KVER-$KREL.src.rpm"
 		fi
 
 		echo "Unpacking kernel source"
@@ -329,7 +350,9 @@ else
 		mv "$(rpm --eval %{_builddir})"/kernel-*/linux-"$ARCHVERSION" "$SRCDIR" >> "$LOGFILE" 2>&1 || die
 
 		cp "$SRCDIR/.config" "$OBJDIR" || die
-		echo "-${ARCHVERSION##*-}" > "$SRCDIR/localversion" || die
+		if [[ "$ARCHVERSION" == *-* ]]; then
+			echo "-${ARCHVERSION##*-}" > "$SRCDIR/localversion" || die
+		fi
 
 		echo $ARCHVERSION > "$VERSIONFILE" || die
 
@@ -357,7 +380,7 @@ else
 		# The linux-source packages are formatted like the following for:
 		# ubuntu: linux-source-3.13.0_3.13.0-24.46_all.deb
 		# debian: linux-source-3.14_3.14.7-1_all.deb
-		pkgver="${ARCHVERSION%%-*}_$(dpkg-query -W -f='${Version}' linux-image-$(uname -r))"
+		pkgver="$KVER_$(dpkg-query -W -f='${Version}' linux-image-$ARCHVERSION)"
 		pkgname="linux-source-${pkgver}_all"
 
 		cd $TEMPDIR
@@ -368,11 +391,13 @@ else
 		echo "Unpacking kernel source"
 		dpkg -x ${pkgname}.deb $TEMPDIR >> "$LOGFILE" || die "dpkg: Could not extract ${pkgname}.deb"
 		# extract and move to SRCDIR
-		tar $taroptions usr/src/linux-source-${ARCHVERSION%%-*}.tar.${extension} >> "$LOGFILE" || die "tar: Failed to extract kernel source package"
+		tar $taroptions usr/src/linux-source-$KVER.tar.${extension} >> "$LOGFILE" || die "tar: Failed to extract kernel source package"
 		clean_cache
-		mv linux-source-${ARCHVERSION%%-*} "$SRCDIR" || die
+		mv linux-source-$KVER "$SRCDIR" || die
 		cp "/boot/config-${ARCHVERSION}" "$OBJDIR/.config" || die
-		echo "-${ARCHVERSION#*-}" > "$SRCDIR/localversion" || die
+		if [[ "$ARCHVERSION" == *-* ]]; then
+			echo "-${ARCHVERSION#*-}" > "$SRCDIR/localversion" || die
+		fi
 		# for some reason the Ubuntu kernel versions don't follow the
 		# upstream SUBLEVEL; they are always at SUBLEVEL 0
 		sed -i "s/^SUBLEVEL.*/${sublevel}/" "$SRCDIR/Makefile" || die
@@ -398,8 +423,14 @@ echo "Building patched kernel"
 patch -N -p1 < "$APPLIEDPATCHFILE" >> "$LOGFILE" 2>&1 || die
 mkdir -p "$TEMPDIR/orig" "$TEMPDIR/patched"
 export TEMPDIR
-CROSS_COMPILE="$TOOLSDIR/kpatch-gcc " make "-j$CPUS" $TARGETS "O=$OBJDIR"  >> "$LOGFILE" 2>&1 || die
+# TODO: remove custom LDFLAGS and ugly "undefined reference" grep when core
+# module gets moved to the kernel tree
+CROSS_COMPILE="$TOOLSDIR/kpatch-gcc " \
+	LDFLAGS_vmlinux="--warn-unresolved-symbols" \
+	LDFLAGS_MODULE="--warn-unresolved-symbols" \
+	make "-j$CPUS" $TARGETS "O=$OBJDIR"  >> "$LOGFILE" 2>&1 || die
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || die
+grep -q "undefined reference" "$LOGFILE" | grep -qv kpatch_shadow && die
 
 if [[ ! -e "$TEMPDIR/changed_objs" ]]; then
 	die "no changed objects found"
@@ -418,6 +449,7 @@ cd "$TEMPDIR"
 mkdir output
 declare -A objnames
 CHANGED=0
+ERROR=0
 for i in $FILES; do
 	mkdir -p "output/$(dirname $i)"
 	cd "$OBJDIR"
@@ -436,19 +468,22 @@ for i in $FILES; do
 		warn "create-diff-object SIGSEGV"
 		if ls core* &> /dev/null; then
 			cp core* /tmp
-			warn "core file at /tmp/$(ls core*)"
-		else
-			warn "no core file found, run 'ulimit -c unlimited' and try to recreate"
+			die "core file at /tmp/$(ls core*)"
 		fi
-		exit 1
+		die "no core file found, run 'ulimit -c unlimited' and try to recreate"
 	fi
 	# create-diff-object returns 3 if no functional change is found
-	[[ $rc -eq 0 ]] || [[ $rc -eq 3 ]] || die
+	[[ $rc -eq 0 ]] || [[ $rc -eq 3 ]] || ERROR=$(expr $ERROR "+" 1)
 	if [[ $rc -eq 0 ]]; then
+		[[ -n $ERROR_IF_DIFF ]] && die $ERROR_IF_DIFF
 		CHANGED=1
 		objnames[$KOBJFILE]=1
 	fi
 done
+
+if [[ $ERROR -ne 0 ]]; then
+	die "$ERROR error(s) encountered"
+fi
 
 if [[ $CHANGED -eq 0 ]]; then
 	die "no functional changes found"
@@ -464,6 +499,9 @@ cd "$SRCDIR"
 make prepare >> "$LOGFILE" 2>&1 || die
 cd "$TEMPDIR/output"
 ld -r -o ../patch/output.o $(find . -name "*.o") >> "$LOGFILE" 2>&1 || die
+md5sum ../patch/output.o | awk '{printf "%s\0", $1}' > checksum.tmp || die
+objcopy --add-section .kpatch.checksum=checksum.tmp --set-section-flags .kpatch.checksum=alloc,load,contents,readonly  ../patch/output.o || die
+rm -f checksum.tmp
 cd "$TEMPDIR/patch"
 KPATCH_BUILD="$SRCDIR" KPATCH_NAME="$PATCHNAME" KBUILD_EXTRA_SYMBOLS="$SYMVERSFILE" make "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
 
