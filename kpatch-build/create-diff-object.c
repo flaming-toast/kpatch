@@ -133,7 +133,7 @@ struct rela {
 	struct list_head list;
 	GElf_Rela rela;
 	struct symbol *sym;
-	unsigned char type;
+	unsigned int type;
 	int addend;
 	int offset;
 	char *string;
@@ -314,8 +314,7 @@ void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 		if (!rela->sym)
 			ERROR("could not find rela entry symbol\n");
 		if (rela->sym->sec &&
-		    ((rela->sym->sec->sh.sh_flags & SHF_STRINGS) ||
-		     !strncmp(rela->sym->name, ".rodata.__func__.", 17))) {
+		    (rela->sym->sec->sh.sh_flags & SHF_STRINGS)) {
 			rela->string = rela->sym->sec->data->d_buf + rela->addend;
 			if (!rela->string)
 				ERROR("could not lookup rela string for %s+%d",
@@ -516,70 +515,90 @@ struct kpatch_elf *kpatch_elf_open(const char *name)
 
 /*
  * This function detects whether the given symbol is a "special" static local
- * variable (for lack of a better term).  If so, it returns the variable's
- * prefix string (with the trailing number removed).
+ * variable (for lack of a better term).
  *
  * Special static local variables should never be correlated and should always
  * be included if they are referenced by an included function.
  */
-char *special_static_prefix(struct symbol *sym)
+static int is_special_static(struct symbol *sym)
 {
+	static char *prefixes[] = {
+		"__key.",
+		"__warned.",
+		"descriptor.",
+		"__func__.",
+		"_rs.",
+		NULL,
+	};
+	char **prefix;
+
 	if (!sym)
-		return NULL;
-
-	if (sym->type == STT_OBJECT &&
-	    sym->bind == STB_LOCAL) {
-		if (!strncmp(sym->name, "__key.", 6))
-			return "__key.";
-
-		if (!strncmp(sym->name, "__warned.", 9))
-			return "__warned.";
-
-		if (!strncmp(sym->name, "descriptor.", 11))
-			return "descriptor.";
-	}
+		return 0;
 
 	if (sym->type == STT_SECTION) {
-		if (!strncmp(sym->name, ".bss.__key.", 11))
-			return ".bss.__key.";
-
 		/* __verbose section contains the descriptor variables */
 		if (!strcmp(sym->name, "__verbose"))
-			return sym->name;
+			return 1;
+
+		/* otherwise make sure section is bundled */
+		if (!sym->sec->sym)
+			return 0;
+
+		/* use bundled object/function symbol for matching */
+		sym = sym->sec->sym;
 	}
 
-	return NULL;
+	if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL)
+		return 0;
+
+	for (prefix = prefixes; *prefix; prefix++)
+		if (!strncmp(sym->name, *prefix, strlen(*prefix)))
+			return 1;
+
+	return 0;
+}
+
+/*
+ * This is like strcmp, but for gcc-mangled symbols.  It skips the comparison
+ * of any substring which consists of '.' followed by any number of digits.
+ */
+static int kpatch_mangled_strcmp(char *s1, char *s2)
+{
+	while (*s1 == *s2) {
+		if (!*s1)
+			return 0;
+		if (*s1 == '.' && isdigit(s1[1])) {
+			if (!isdigit(s2[1]))
+				return 1;
+			while (isdigit(*++s1))
+				;
+			while (isdigit(*++s2))
+				;
+		} else {
+			s1++;
+			s2++;
+		}
+	}
+	return 1;
 }
 
 int rela_equal(struct rela *rela1, struct rela *rela2)
 {
-	char *prefix1, *prefix2;
-
 	if (rela1->type != rela2->type ||
 	    rela1->offset != rela2->offset)
 		return 0;
 
-	if (rela1->string) {
-		if (rela2->string &&
-		    !strcmp(rela1->string, rela2->string))
-			return 1;
-	} else {
-		if (rela1->addend != rela2->addend)
-			return 0;
+	if (rela1->string)
+		return rela2->string && !strcmp(rela1->string, rela2->string);
 
-		prefix1 = special_static_prefix(rela1->sym);
-		if (prefix1) {
-			prefix2 = special_static_prefix(rela2->sym);
-			if (!prefix2)
-				return 0;
-			return !strcmp(prefix1, prefix2);
-		}
+	if (rela1->addend != rela2->addend)
+		return 0;
 
-		if (!strcmp(rela1->sym->name, rela2->sym->name))
-			return 1;
-	}
+	if (is_special_static(rela1->sym))
+		return !kpatch_mangled_strcmp(rela1->sym->name,
+					      rela2->sym->name);
 
-	return 0;
+	return !strcmp(rela1->sym->name, rela2->sym->name);
 }
 
 void kpatch_compare_correlated_rela_section(struct section *sec)
@@ -644,17 +663,124 @@ out:
 		log_debug("section %s has changed\n", sec->name);
 }
 
+/*
+ * Determine if a section has changed only due to a WARN* macro call's
+ * embedding of the line number into an instruction operand.
+ *
+ * Warning: Hackery lies herein.  It's hopefully justified by the fact that
+ * this issue is very common.
+ *
+ * base object:
+ *
+ * be 5e 04 00 00          mov    $0x45e,%esi
+ * 48 c7 c7 ff 5a a1 81    mov    $0xffffffff81a15aff,%rdi
+ * e8 26 13 08 00          callq  ffffffff8108d0d0 <warn_slowpath_fmt>
+ *
+ * patched object:
+ *
+ * be 5e 04 00 00          mov    $0x45f,%esi
+ * 48 c7 c7 ff 5a a1 81    mov    $0xffffffff81a15aff,%rdi
+ * e8 26 13 08 00          callq  ffffffff8108d0d0 <warn_slowpath_fmt>
+ *
+ * The above is the most common case.  The pattern which applies to all cases
+ * is an immediate move of the line number to %esi followed by zero or more
+ * relas to a string section followed by a rela to warn_slowpath_*.
+ *
+ */
+static int kpatch_warn_only_change(struct section *sec)
+{
+	struct insn insn1, insn2;
+	unsigned long start1, start2, size, offset, length;
+	struct rela *rela;
+	int warnonly = 0, found;
+
+	if (sec->status != CHANGED ||
+	    is_rela_section(sec) ||
+	    !is_text_section(sec) ||
+	    sec->sh.sh_size != sec->twin->sh.sh_size ||
+	    !sec->rela ||
+	    sec->rela->status != SAME)
+		return 0;
+
+	start1 = (unsigned long)sec->twin->data->d_buf;
+	start2 = (unsigned long)sec->data->d_buf;
+	size = sec->sh.sh_size;
+	for (offset = 0; offset < size; offset += length) {
+		insn_init(&insn1, (void *)(start1 + offset), 1);
+		insn_init(&insn2, (void *)(start2 + offset), 1);
+		insn_get_length(&insn1);
+		insn_get_length(&insn2);
+		length = insn1.length;
+
+		if (!insn1.length || !insn2.length)
+			ERROR("can't decode instruction in section %s at offset 0x%lx",
+			      sec->name, offset);
+
+		if (insn1.length != insn2.length)
+			return 0;
+
+		if (!memcmp((void *)start1 + offset, (void *)start2 + offset,
+			    length))
+			continue;
+
+		/* verify it's a mov immediate to %esi */
+		insn_get_opcode(&insn1);
+		insn_get_opcode(&insn2);
+		if (insn1.opcode.value != 0xbe || insn2.opcode.value != 0xbe)
+			return 0;
+
+		/*
+		 * Verify zero or more string relas followed by a
+		 * warn_slowpath_* rela.
+		 */
+		found = 0;
+		list_for_each_entry(rela, &sec->rela->relas, list) {
+			if (rela->offset < offset + length)
+				continue;
+			if (rela->string)
+				continue;
+			if (!strncmp(rela->sym->name, "warn_slowpath_", 14)) {
+				found = 1;
+				break;
+			}
+			return 0;
+		}
+		if (!found)
+			return 0;
+
+		warnonly = 1;
+	}
+
+	if (!warnonly)
+		ERROR("no instruction changes detected for changed section %s",
+		      sec->name);
+
+	return 1;
+}
+
 void kpatch_compare_sections(struct list_head *seclist)
 {
 	struct section *sec;
 
+	/* compare all sections */
 	list_for_each_entry(sec, seclist, list) {
 		if (sec->twin)
 			kpatch_compare_correlated_section(sec);
 		else
 			sec->status = NEW;
+	}
 
-		/* sync symbol status */
+	/* exclude WARN-only changes */
+	list_for_each_entry(sec, seclist, list) {
+		if (kpatch_warn_only_change(sec)) {
+			log_debug("reverting WARN-only section %s status to SAME\n",
+				  sec->name);
+			sec->status = SAME;
+		}
+	}
+
+	/* sync symbol status */
+	list_for_each_entry(sec, seclist, list) {
 		if (is_rela_section(sec)) {
 			if (sec->base->sym && sec->base->sym->status != CHANGED)
 				sec->base->sym->status = sec->status;
@@ -724,7 +850,9 @@ void kpatch_correlate_sections(struct list_head *seclist1, struct list_head *sec
 			if (strcmp(sec1->name, sec2->name))
 				continue;
 
-			if (special_static_prefix(sec1->secsym))
+			if (is_special_static(is_rela_section(sec1) ?
+					      sec1->base->secsym :
+					      sec1->secsym))
 				continue;
 
 			/*
@@ -757,7 +885,7 @@ void kpatch_correlate_symbols(struct list_head *symlist1, struct list_head *syml
 			    sym1->type != sym2->type)
 				continue;
 
-			if (special_static_prefix(sym1))
+			if (is_special_static(sym1))
 				continue;
 
 			/* group section symbols must have correlated sections */
@@ -834,30 +962,6 @@ void kpatch_mark_grouped_sections(struct kpatch_elf *kelf)
 }
 
 /*
- * This is like strcmp, but for gcc-mangled symbols.  It skips the comparison
- * of any substring which consists of '.' followed by any number of digits.
- */
-static int kpatch_mangled_strcmp(char *s1, char *s2)
-{
-	while (*s1 == *s2) {
-		if (!*s1)
-			return 0;
-		if (*s1 == '.' && isdigit(s1[1])) {
-			if (!isdigit(s2[1]))
-				return 1;
-			while (isdigit(*++s1))
-				;
-			while (isdigit(*++s2))
-				;
-		} else {
-			s1++;
-			s2++;
-		}
-	}
-	return 1;
-}
-
-/*
  * When gcc makes compiler optimizations which affect a function's calling
  * interface, it mangles the function's name.  For example, sysctl_print_dir is
  * renamed to sysctl_print_dir.isra.2.  The problem is that the trailing number
@@ -927,6 +1031,58 @@ void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 	}
 }
 
+static char *kpatch_section_function_name(struct section *sec)
+{
+	if (is_rela_section(sec))
+		sec = sec->base;
+	return sec->sym ? sec->sym->name : sec->name;
+}
+
+/*
+ * Given a static local variable symbol and a section which references it in
+ * the patched object, find a corresponding usage of a similarly named symbol
+ * in the base object.
+ */
+static struct symbol *kpatch_find_static_twin(struct section *sec,
+					      struct symbol *sym)
+{
+	struct rela *rela;
+	struct symbol *basesym;
+
+	if (!sec->twin)
+		return NULL;
+
+	/*
+	 * Ensure there are no other orphaned static variables with the
+	 * same name in the function.  This is possible if the
+	 * variables are in different scopes or if one of them is part of an
+	 * inlined function.
+	 */
+	list_for_each_entry(rela, &sec->relas, list) {
+		if (rela->sym == sym || rela->sym->twin)
+			continue;
+		if (!kpatch_mangled_strcmp(rela->sym->name, sym->name))
+			ERROR("found another static local variable matching %s in patched %s",
+			      sym->name, kpatch_section_function_name(sec));
+	}
+
+	/* find the base object's corresponding variable */
+	basesym = NULL;
+	list_for_each_entry(rela, &sec->twin->relas, list) {
+		if (rela->sym->twin)
+			continue;
+		if (kpatch_mangled_strcmp(rela->sym->name, sym->name))
+			continue;
+		if (basesym && basesym != rela->sym)
+			ERROR("found two static local variables matching %s in orig %s",
+			      sym->name, kpatch_section_function_name(sec));
+
+		basesym = rela->sym;
+	}
+
+	return basesym;
+}
+
 /*
  * gcc renames static local variables by appending a period and a number.  For
  * example, __foo could be renamed to __foo.31452.  Unfortunately this number
@@ -936,7 +1092,7 @@ void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 					     struct kpatch_elf *patched)
 {
-	struct symbol *sym, *basesym;
+	struct symbol *sym, *basesym, *tmpsym;
 	struct section *tmpsec, *sec;
 	struct rela *rela;
 	int bundled, basebundled;
@@ -946,23 +1102,23 @@ void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 		    sym->twin)
 			continue;
 
-		if (special_static_prefix(sym))
+		if (is_special_static(sym))
 			continue;
 
 		if (!strchr(sym->name, '.'))
 			continue;
 
 		/*
-		 * __func__'s are special gcc static variables which contain
-		 * the function name.  There's no need to correlate them
-		 * because they're read-only and their comparison is done in
-		 * rela_equal() by comparing the literal strings.
+		 * For each function which uses the variable in the patched
+		 * object, look for a corresponding use in the function's twin
+		 * in the base object.
+		 *
+		 * It's possible for multiple functions to use the same static
+		 * local variable if the variable is defined in an inlined
+		 * function.
 		 */
-		if (!kpatch_mangled_strcmp(sym->name, "__func__.1"))
-			continue;
-
-		/* find the patched function which uses the static variable */
 		sec = NULL;
+		basesym = NULL;
 		list_for_each_entry(tmpsec, &patched->sections, list) {
 			if (!is_rela_section(tmpsec) ||
 			    !is_text_section(tmpsec->base) ||
@@ -971,47 +1127,30 @@ void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 			list_for_each_entry(rela, &tmpsec->relas, list) {
 				if (rela->sym != sym)
 					continue;
-				if (sec)
-					ERROR("static local variable %s used by two functions",
-					      sym->name);
+
+				tmpsym = kpatch_find_static_twin(tmpsec, sym);
+				if (basesym && tmpsym && basesym != tmpsym)
+					ERROR("found two twins for static local variable %s: %s and %s",
+					      sym->name, basesym->name,
+					      tmpsym->name);
+				if (tmpsym && !basesym)
+					basesym = tmpsym;
+
 				sec = tmpsec;
 				break;
 			}
 		}
+
 		if (!sec)
 			ERROR("static local variable %s not used", sym->name);
 
-		if (!sec->twin)
+		if (!basesym) {
+			log_normal("WARNING: unable to correlate static local variable %s used by %s, assuming variable is new\n",
+				   sym->name,
+				   kpatch_section_function_name(sec));
 			continue;
-
-		/*
-		 * Ensure there are no other orphaned static variables with the
-		 * same name in the function.  This is possible if the
-		 * variables are in different scopes (using C braces).
-		 */
-		list_for_each_entry(rela, &sec->relas, list) {
-			if (rela->sym == sym || rela->sym->twin)
-				continue;
-			if (!kpatch_mangled_strcmp(rela->sym->name, sym->name))
-				ERROR("found another static local variable matching %s in patched %s",
-				      sym->name, sec->name);
 		}
 
-		/* find the base object's corresponding variable */
-		basesym = NULL;
-		list_for_each_entry(rela, &sec->twin->relas, list) {
-			if (rela->sym->twin)
-				continue;
-			if (kpatch_mangled_strcmp(rela->sym->name, sym->name))
-				continue;
-			if (basesym && basesym != rela->sym)
-				ERROR("found two static local variables matching %s in orig %s",
-				      sym->name, sec->name);
-
-			basesym = rela->sym;
-		}
-		if (!basesym)
-			continue;
 
 		bundled = sym == sym->sec->sym;
 		basebundled = basesym == basesym->sec->sym;
@@ -1102,38 +1241,43 @@ void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 				continue;
 			}
 
+			if (rela->type == R_X86_64_PC32) {
+				struct insn insn;
+				rela_insn(sec, rela, &insn);
+				add_off = (long)insn.next_byte -
+					  (long)sec->base->data->d_buf -
+					  rela->offset;
+			} else if (rela->type == R_X86_64_64 ||
+				   rela->type == R_X86_64_32S)
+				add_off = 0;
+			else
+				continue;
+
 			/*
 			 * Attempt to replace references to unbundled sections
 			 * with their symbols.
 			 */
 			list_for_each_entry(sym, &kelf->symbols, list) {
+				int start, end;
 
 				if (sym->type == STT_SECTION ||
 				    sym->sec != rela->sym->sec)
 					continue;
 
-				if (rela->type == R_X86_64_PC32) {
-					struct insn insn;
-					rela_insn(sec, rela, &insn);
-					add_off = (long)insn.next_byte -
-						  (long)sec->base->data->d_buf -
-						  rela->offset;
-				} else if (rela->type == R_X86_64_64 ||
-					   rela->type == R_X86_64_32S)
-					add_off = 0;
-				else
-					continue;
+				start = sym->sym.st_value;
+				end = sym->sym.st_value + sym->sym.st_size;
 
-				if (sym->sym.st_value != rela->addend + add_off)
+				if (rela->addend + add_off < start ||
+				    rela->addend + add_off >= end)
 					continue;
 
 				log_debug("%s: replacing %s+%d reference with %s+%d\n",
 					  sec->name,
 					  rela->sym->name, rela->addend,
-					  sym->name, rela->addend - add_off);
+					  sym->name, rela->addend - start);
 
 				rela->sym = sym;
-				rela->addend = -add_off;
+				rela->addend -= start;
 				break;
 			}
 		}
@@ -1694,6 +1838,7 @@ void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 		/* no changed or global functions referenced */
 		sec->status = sec->base->status = SAME;
 		sec->include = sec->base->include = 0;
+		free(dest);
 		return;
 	}
 
@@ -2214,7 +2359,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 	struct symbol *strsym;
 	struct lookup_result result;
 	struct kpatch_patch_dynrela *dynrelas;
-	int vmlinux, exported;
+	int vmlinux, external;
 
 	vmlinux = !strcmp(objname, "vmlinux");
 
@@ -2262,7 +2407,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 			if (kpatch_is_core_module_symbol(rela->sym->name))
 				continue;
 
-			exported = 0;
+			external = 0;
 
 			if (rela->sym->bind == STB_LOCAL) {
 				/* An unchanged local symbol */
@@ -2311,10 +2456,11 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 				if (lookup_global_symbol(table, rela->sym->name,
 							 &result))
 					/*
-					 * Not there, assume it's exported by
-					 * another object.
+					 * Not there, assume it's either an
+					 * exported symbol or provided by
+					 * another .o in the patch module.
 					 */
-					exported = 1;
+					external = 1;
 			}
 			log_debug("lookup for %s @ 0x%016lx len %lu\n",
 			          rela->sym->name, result.value, result.size);
@@ -2327,7 +2473,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 				dynrelas[index].src = 0;
 			dynrelas[index].addend = rela->addend;
 			dynrelas[index].type = rela->type;
-			dynrelas[index].exported = exported;
+			dynrelas[index].external = external;
 
 			/* add rela to fill in dest field */
 			ALLOC_LINK(dynrela, &relasec->relas);
