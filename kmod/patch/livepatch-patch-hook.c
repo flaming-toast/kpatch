@@ -54,19 +54,13 @@ static int patch_objects_nr;
 struct patch_object {
 	struct list_head list;
 	struct list_head funcs;
-	struct list_head relocs;
 	const char *name;
-	int funcs_nr, relocs_nr;
+	int funcs_nr;
 };
 
 struct patch_func {
 	struct list_head list;
 	struct kpatch_patch_func *kfunc;
-};
-
-struct patch_reloc {
-	struct list_head list;
-	struct kpatch_patch_dynrela *kdynrela;
 };
 
 static struct patch_object *patch_alloc_new_object(const char *name)
@@ -77,7 +71,6 @@ static struct patch_object *patch_alloc_new_object(const char *name)
 	if (!object)
 		return NULL;
 	INIT_LIST_HEAD(&object->funcs);
-	INIT_LIST_HEAD(&object->relocs);
 	if (strcmp(name, "vmlinux"))
 		object->name = name;
 	list_add(&object->list, &patch_objects);
@@ -117,30 +110,8 @@ static int patch_add_func_to_object(struct kpatch_patch_func *kfunc)
 	return 0;
 }
 
-static int patch_add_reloc_to_object(struct kpatch_patch_dynrela *kdynrela)
-{
-	struct patch_reloc *reloc;
-	struct patch_object *object;
-
-	reloc = kzalloc(sizeof(*reloc), GFP_KERNEL);
-	if (!reloc)
-		return -ENOMEM;
-	INIT_LIST_HEAD(&reloc->list);
-	reloc->kdynrela = kdynrela;
-
-	object = patch_find_object_by_name(kdynrela->objname);
-	if (!object) {
-		kfree(reloc);
-		return -ENOMEM;
-	}
-	list_add(&reloc->list, &object->relocs);
-	object->relocs_nr++;
-	return 0;
-}
-
 static void patch_free_scaffold(void) {
 	struct patch_func *func, *safefunc;
-	struct patch_reloc *reloc, *safereloc;
 	struct patch_object *object, *safeobject;
 
 	list_for_each_entry_safe(object, safeobject, &patch_objects, list) {
@@ -148,11 +119,6 @@ static void patch_free_scaffold(void) {
 		                         &object->funcs, list) {
 			list_del(&func->list);
 			kfree(func);
-		}
-		list_for_each_entry_safe(reloc, safereloc,
-		                         &object->relocs, list) {
-			list_del(&reloc->list);
-			kfree(reloc);
 		}
 		list_del(&object->list);
 		kfree(object);
@@ -167,8 +133,6 @@ static void patch_free_livepatch(struct klp_patch *patch)
 		for (object = patch->objs; object && object->funcs; object++) {
 			if (object->funcs)
 				kfree(object->funcs);
-			if (object->relocs)
-				kfree(object->relocs);
 		}
 		if (patch->objs)
 			kfree(patch->objs);
@@ -177,33 +141,21 @@ static void patch_free_livepatch(struct klp_patch *patch)
 }
 
 extern struct kpatch_patch_func __kpatch_funcs[], __kpatch_funcs_end[];
-extern struct kpatch_patch_dynrela __kpatch_dynrelas[], __kpatch_dynrelas_end[];
 
 static int __init patch_init(void)
 {
 	struct kpatch_patch_func *kfunc;
-	struct kpatch_patch_dynrela *kdynrela;
 	struct klp_object *lobjects, *lobject;
 	struct klp_func *lfuncs, *lfunc;
-	struct klp_reloc *lrelocs, *lreloc;
 	struct patch_object *object;
 	struct patch_func *func;
-	struct patch_reloc *reloc;
 	int ret = 0, i, j;
 
-	/* organize functions and relocs by object in scaffold */
+	/* organize functions by object in scaffold */
 	for (kfunc = __kpatch_funcs;
 	     kfunc != __kpatch_funcs_end;
 	     kfunc++) {
 		ret = patch_add_func_to_object(kfunc);
-		if (ret)
-			goto out;
-	}
-
-	for (kdynrela = __kpatch_dynrelas;
-	     kdynrela != __kpatch_dynrelas_end;
-	     kdynrela++) {
-		ret = patch_add_reloc_to_object(kdynrela);
 		if (ret)
 			goto out;
 	}
@@ -238,23 +190,6 @@ static int __init patch_init(void)
 			lfunc->old_name = func->kfunc->name;
 			lfunc->new_func = (void *)func->kfunc->new_addr;
 			lfunc->old_addr = func->kfunc->old_addr;
-			j++;
-		}
-
-		lrelocs = kzalloc(sizeof(struct klp_reloc) *
-				  (object->relocs_nr+1), GFP_KERNEL);
-		if (!lrelocs)
-			goto out;
-		lobject->relocs = lrelocs;
-		j = 0;
-		list_for_each_entry(reloc, &object->relocs, list) {
-			lreloc = &lrelocs[j];
-			lreloc->loc = reloc->kdynrela->dest;
-			lreloc->val = reloc->kdynrela->src;
-			lreloc->type = reloc->kdynrela->type;
-			lreloc->name = reloc->kdynrela->name;
-			lreloc->addend = reloc->kdynrela->addend;
-			lreloc->external = reloc->kdynrela->external;
 			j++;
 		}
 
@@ -295,3 +230,4 @@ static void __exit patch_exit(void)
 module_init(patch_init);
 module_exit(patch_exit);
 MODULE_LICENSE("GPL");
+MODULE_INFO(livepatch, "Y");
