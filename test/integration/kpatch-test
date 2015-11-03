@@ -45,6 +45,7 @@ ROOTDIR="$(readlink -f $SCRIPTDIR/../..)"
 # TODO: option to use system-installed binaries instead
 KPATCH="sudo $ROOTDIR/kpatch/kpatch"
 RMMOD="sudo rmmod"
+unset CCACHE_HASHDIR
 KPATCHBUILD="$ROOTDIR"/kpatch-build/kpatch-build
 ERROR=0
 LOG=test.log
@@ -148,23 +149,8 @@ run_load_test() {
 	fi
 
 
-	if ! $KPATCH replace $module >> $LOG 2>&1; then
-		error "$prefix: kpatch replace failed"
-		return
-	fi
-
-	if [[ -e $testprog ]] && ! ./$testprog >> $LOG 2>&1; then
-		error "$prefix: $testprog failed after kpatch replace"
-		return
-	fi
-
-	if ! $KPATCH unload $module >> $LOG 2>&1; then
-		error "$prefix: kpatch unload failed"
-		return
-	fi
-
 	if [[ -e $testprog ]] && ./$testprog >> $LOG 2>&1; then
-		error "$prefix: $testprog succeeded after kpatch unload"
+		error "$prefix: $testprog succeeded before kpatch load"
 		return
 	fi
 
@@ -175,6 +161,15 @@ run_load_test() {
 
 	if [[ -e $testprog ]] && ! ./$testprog >> $LOG 2>&1; then
 		error "$prefix: $testprog failed after kpatch load"
+	fi
+
+	if ! $KPATCH unload $module >> $LOG 2>&1; then
+		error "$prefix: kpatch unload failed"
+		return
+	fi
+
+	if [[ -e $testprog ]] && ./$testprog >> $LOG 2>&1; then
+		error "$prefix: $testprog succeeded after kpatch unload"
 		return
 	fi
 }
@@ -240,23 +235,45 @@ run_combined_test() {
 
 	log "load test: combined module"
 
-	if ! $KPATCH replace kpatch-COMBINED.ko >> $LOG 2>&1; then
-		error "combined: kpatch replace failed"
+	unload_all
+
+	for testprog in *.test; do
+		[[ $testprog != *-LOADED.test ]] && continue
+		if ./$testprog >> $LOG 2>&1; then
+			error "combined: $testprog succeeded before kpatch load"
+			return
+		fi
+	done
+
+	if ! $KPATCH load kpatch-COMBINED.ko >> $LOG 2>&1; then
+		error "combined: kpatch load failed"
 		return
 	fi
 
 	for testprog in *.test; do
 		[[ $testprog != *-LOADED.test ]] && continue
 		if ! ./$testprog >> $LOG 2>&1; then
-			error "combined: $testprog failed"
+			error "combined: $testprog failed after kpatch load"
 		fi
 	done
+
+	if ! $KPATCH unload kpatch-COMBINED.ko >> $LOG 2>&1; then
+		error "combined: kpatch unload failed"
+		return
+	fi
+
+	for testprog in *.test; do
+		[[ $testprog != *-LOADED.test ]] && continue
+		if ./$testprog >> $LOG 2>&1; then
+			error "combined: $testprog succeeded after kpatch unload"
+			return
+		fi
+	done
+
 }
 
 echo "clearing printk buffer"
 sudo dmesg -C
-
-cd "$SCRIPTDIR"
 
 if [[ $QUICK != 1 ]]; then
 	for file in *.patch; do

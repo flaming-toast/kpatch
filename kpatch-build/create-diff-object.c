@@ -127,6 +127,7 @@ struct symbol {
 		int include; /* used in the patched elf */
 		int strip; /* used in the output elf */
 	};
+	int has_fentry_call;
 };
 
 struct rela {
@@ -472,6 +473,24 @@ void kpatch_create_symbol_list(struct kpatch_elf *kelf)
 
 }
 
+/* Check which functions have fentry calls; save this info for later use. */
+static void kpatch_find_fentry_calls(struct kpatch_elf *kelf)
+{
+	struct symbol *sym;
+	struct rela *rela;
+	list_for_each_entry(sym, &kelf->symbols, list) {
+		if (sym->type != STT_FUNC || !sym->sec->rela)
+			continue;
+
+		rela = list_first_entry(&sym->sec->rela->relas, struct rela,
+					list);
+		if (rela->type != R_X86_64_NONE ||
+		    strcmp(rela->sym->name, "__fentry__"))
+			continue;
+
+		sym->has_fentry_call = 1;
+	}
+}
 
 struct kpatch_elf *kpatch_elf_open(const char *name)
 {
@@ -510,6 +529,7 @@ struct kpatch_elf *kpatch_elf_open(const char *name)
 		kpatch_create_rela_list(kelf, sec);
 	}
 
+	kpatch_find_fentry_calls(kelf);
 	return kelf;
 }
 
@@ -1039,138 +1059,220 @@ static char *kpatch_section_function_name(struct section *sec)
 }
 
 /*
- * Given a static local variable symbol and a section which references it in
- * the patched object, find a corresponding usage of a similarly named symbol
- * in the base object.
+ * Given a static local variable symbol and a rela section which references it
+ * in the base object, find a corresponding usage of a similarly named symbol
+ * in the patched object.
  */
 static struct symbol *kpatch_find_static_twin(struct section *sec,
 					      struct symbol *sym)
 {
 	struct rela *rela;
-	struct symbol *basesym;
 
 	if (!sec->twin)
 		return NULL;
 
-	/*
-	 * Ensure there are no other orphaned static variables with the
-	 * same name in the function.  This is possible if the
-	 * variables are in different scopes or if one of them is part of an
-	 * inlined function.
-	 */
-	list_for_each_entry(rela, &sec->relas, list) {
-		if (rela->sym == sym || rela->sym->twin)
-			continue;
-		if (!kpatch_mangled_strcmp(rela->sym->name, sym->name))
-			ERROR("found another static local variable matching %s in patched %s",
-			      sym->name, kpatch_section_function_name(sec));
-	}
-
-	/* find the base object's corresponding variable */
-	basesym = NULL;
+	/* find the patched object's corresponding variable */
 	list_for_each_entry(rela, &sec->twin->relas, list) {
+
 		if (rela->sym->twin)
 			continue;
+
 		if (kpatch_mangled_strcmp(rela->sym->name, sym->name))
 			continue;
-		if (basesym && basesym != rela->sym)
-			ERROR("found two static local variables matching %s in orig %s",
-			      sym->name, kpatch_section_function_name(sec));
 
-		basesym = rela->sym;
+		return rela->sym;
 	}
 
-	return basesym;
+	return NULL;
 }
 
 /*
  * gcc renames static local variables by appending a period and a number.  For
  * example, __foo could be renamed to __foo.31452.  Unfortunately this number
- * can arbitrarily change.  Try to rename the patched version of the symbol to
- * match the base version and then correlate them.
+ * can arbitrarily change.  Correlate them by comparing which functions
+ * reference them, and rename the patched symbols to match the base symbol
+ * names.
  */
 void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 					     struct kpatch_elf *patched)
 {
-	struct symbol *sym, *basesym, *tmpsym;
-	struct section *tmpsec, *sec;
+	struct symbol *sym, *patched_sym, *tmpsym;
+	struct section *sec;
 	struct rela *rela;
-	int bundled, basebundled;
+	int bundled, patched_bundled;
 
-	list_for_each_entry(sym, &patched->symbols, list) {
-		if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL ||
-		    sym->twin)
-			continue;
+	list_for_each_entry(sym, &base->symbols, list) {
 
-		if (is_special_static(sym))
+		if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL)
 			continue;
 
 		if (!strchr(sym->name, '.'))
 			continue;
 
+		if (is_special_static(sym))
+			continue;
+
 		/*
-		 * For each function which uses the variable in the patched
-		 * object, look for a corresponding use in the function's twin
-		 * in the base object.
-		 *
-		 * It's possible for multiple functions to use the same static
-		 * local variable if the variable is defined in an inlined
-		 * function.
+		 * Undo any previous correlation.  Two static locals can have
+		 * the same numbered suffix in the base and patched objects by
+		 * coincidence.
 		 */
-		sec = NULL;
-		basesym = NULL;
-		list_for_each_entry(tmpsec, &patched->sections, list) {
-			if (!is_rela_section(tmpsec) ||
-			    !is_text_section(tmpsec->base) ||
-			    is_debug_section(tmpsec))
+		if (sym->twin) {
+			sym->twin->twin = NULL;
+			sym->twin = NULL;
+		}
+		bundled = sym == sym->sec->sym;
+		if (bundled && sym->sec->twin) {
+			sym->sec->twin->twin = NULL;
+			sym->sec->twin = NULL;
+		}
+
+		/*
+		 *
+		 * Some surprising facts about static local variable symbols:
+		 *
+		 * - It's possible for multiple functions to use the same
+		 *   static local variable if the variable is defined in an
+		 *   inlined function.
+		 *
+		 * - It's also possible for multiple static local variables
+		 *   with the same name to be used in the same function if they
+		 *   have different scopes.  (We have to assume that in such
+		 *   cases, the order in which they're referenced remains the
+		 *   same between the base and patched objects, as there's no
+		 *   other way to distinguish them.)
+		 *
+		 * - Static locals are usually referenced by functions, but
+		 *   they can occasionally be referenced by data sections as
+		 *   well.
+		 *
+		 * For each section which references the variable in the base
+		 * object, look for a corresponding reference in the section's
+		 * twin in the patched object.
+		 */
+		patched_sym = NULL;
+		list_for_each_entry(sec, &base->sections, list) {
+
+			if (!is_rela_section(sec) ||
+			    is_debug_section(sec))
 				continue;
-			list_for_each_entry(rela, &tmpsec->relas, list) {
+
+			list_for_each_entry(rela, &sec->relas, list) {
+
 				if (rela->sym != sym)
 					continue;
 
-				tmpsym = kpatch_find_static_twin(tmpsec, sym);
-				if (basesym && tmpsym && basesym != tmpsym)
-					ERROR("found two twins for static local variable %s: %s and %s",
-					      sym->name, basesym->name,
-					      tmpsym->name);
-				if (tmpsym && !basesym)
-					basesym = tmpsym;
+				if (bundled && sym->sec == sec->base) {
+					/*
+					 * A rare case where a static local
+					 * data structure references itself.
+					 * There's no reliable way to correlate
+					 * this.  Hopefully there's another
+					 * reference to the symbol somewhere
+					 * that can be used.
+					 */
+					log_debug("can't correlate static local %s's reference to itself\n",
+						  sym->name);
+					break;
+				}
 
-				sec = tmpsec;
+				tmpsym = kpatch_find_static_twin(sec, sym);
+				if (!tmpsym)
+					DIFF_FATAL("reference to static local variable %s in %s was removed",
+						   sym->name,
+						   kpatch_section_function_name(sec));
+
+				if (patched_sym && patched_sym != tmpsym)
+					DIFF_FATAL("found two twins for static local variable %s: %s and %s",
+						   sym->name, patched_sym->name,
+						   tmpsym->name);
+
+				patched_sym = tmpsym;
+
 				break;
 			}
 		}
 
-		if (!sec)
-			ERROR("static local variable %s not used", sym->name);
-
-		if (!basesym) {
-			log_normal("WARNING: unable to correlate static local variable %s used by %s, assuming variable is new\n",
-				   sym->name,
-				   kpatch_section_function_name(sec));
+		/*
+		 * Check if the symbol is unused.  This is possible if multiple
+		 * static locals in the file refer to the same read-only data,
+		 * and their symbols point to the same bundled section.  In
+		 * such a case we can ignore the extra symbol.
+		 */
+		if (!patched_sym) {
+			log_debug("ignoring base unused static local %s\n",
+				  sym->name);
 			continue;
 		}
 
-
-		bundled = sym == sym->sec->sym;
-		basebundled = basesym == basesym->sec->sym;
-		if (bundled != basebundled)
+		patched_bundled = patched_sym == patched_sym->sec->sym;
+		if (bundled != patched_bundled)
 			ERROR("bundle mismatch for symbol %s", sym->name);
-		if (!bundled && sym->sec->twin != basesym->sec)
+		if (!bundled && sym->sec->twin != patched_sym->sec)
 			ERROR("sections %s and %s aren't correlated",
-			      sym->sec->name, basesym->sec->name);
+			      sym->sec->name, patched_sym->sec->name);
 
-		log_debug("renaming and correlating %s to %s\n",
-			  sym->name, basesym->name);
-		sym->name = strdup(basesym->name);
-		sym->twin = basesym;
-		basesym->twin = sym;
-		sym->status = basesym->status = SAME;
+		log_debug("renaming and correlating static local %s to %s\n",
+			  patched_sym->name, sym->name);
+
+		patched_sym->name = strdup(sym->name);
+		sym->twin = patched_sym;
+		patched_sym->twin = sym;
 
 		if (bundled) {
-			sym->sec->twin = basesym->sec;
-			basesym->sec->twin = sym->sec;
+			sym->sec->twin = patched_sym->sec;
+			patched_sym->sec->twin = sym->sec;
+
+			if (sym->sec->rela && patched_sym->sec->rela) {
+				sym->sec->rela->twin = patched_sym->sec->rela;
+				patched_sym->sec->rela->twin = sym->sec->rela;
+			}
 		}
+	}
+
+	/*
+	 * All the base object's static local variables have been correlated.
+	 * Now go through the patched object and look for any uncorrelated
+	 * static locals to see if we need to print some warnings.
+	 */
+	list_for_each_entry(sym, &patched->symbols, list) {
+
+		if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL ||
+		    sym->twin)
+			continue;
+
+		if (!strchr(sym->name, '.'))
+			continue;
+
+		if (is_special_static(sym))
+			continue;
+
+		list_for_each_entry(sec, &patched->sections, list) {
+
+			if (!is_rela_section(sec) ||
+			    is_debug_section(sec))
+				continue;
+
+			list_for_each_entry(rela, &sec->relas, list) {
+
+				if (rela->sym != sym)
+					continue;
+
+				log_normal("WARNING: unable to correlate static local variable %s used by %s, assuming variable is new\n",
+					   sym->name,
+					   kpatch_section_function_name(sec));
+				return;
+			}
+		}
+
+		/*
+		 * This symbol is unused by any functions.  This is possible if
+		 * multiple static locals in the file refer to the same
+		 * read-only data, and their symbols point to the same bundled
+		 * section.  In such a case we can ignore the extra symbol.
+		 */
+		log_debug("ignoring patched unused static local %s\n",
+			  sym->name);
 	}
 }
 
@@ -1331,6 +1433,25 @@ next:
 			printf(" -> %s", sym->sec->name);
 		printf("\n");
 	}
+}
+
+static void kpatch_check_fentry_calls(struct kpatch_elf *kelf)
+{
+	struct symbol *sym;
+	int errs = 0;
+
+	list_for_each_entry(sym, &kelf->symbols, list) {
+		if (sym->type != STT_FUNC || sym->status != CHANGED)
+			continue;
+		if (!sym->twin->has_fentry_call) {
+			log_normal("function %s has no fentry call, unable to patch\n",
+				   sym->name);
+			errs++;
+		}
+	}
+
+	if (errs)
+		DIFF_FATAL("%d function(s) can not be patched", errs);
 }
 
 void kpatch_verify_patchability(struct kpatch_elf *kelf)
@@ -1675,11 +1796,70 @@ void kpatch_reindex_elements(struct kpatch_elf *kelf)
 }
 
 
-int bug_table_group_size(struct kpatch_elf *kelf, int offset) { return 12; }
-int smp_locks_group_size(struct kpatch_elf *kelf, int offset) { return 4; }
-int parainstructions_group_size(struct kpatch_elf *kelf, int offset) { return 16; }
-int ex_table_group_size(struct kpatch_elf *kelf, int offset) { return 8; }
-int altinstructions_group_size(struct kpatch_elf *kelf, int offset) { return 12; }
+int bug_table_group_size(struct kpatch_elf *kelf, int offset)
+{
+	static int size = 0;
+	char *str;
+
+	if (!size) {
+		str = getenv("BUG_STRUCT_SIZE");
+		if (!str)
+			ERROR("BUG_STRUCT_SIZE not set");
+		size = atoi(str);
+	}
+
+	return size;
+}
+
+int parainstructions_group_size(struct kpatch_elf *kelf, int offset)
+{
+	static int size = 0;
+	char *str;
+
+	if (!size) {
+		str = getenv("PARA_STRUCT_SIZE");
+		if (!str)
+			ERROR("PARA_STRUCT_SIZE not set");
+		size = atoi(str);
+	}
+
+	return size;
+}
+
+int ex_table_group_size(struct kpatch_elf *kelf, int offset)
+{
+	static int size = 0;
+	char *str;
+
+	if (!size) {
+		str = getenv("EX_STRUCT_SIZE");
+		if (!str)
+			ERROR("EX_STRUCT_SIZE not set");
+		size = atoi(str);
+	}
+
+	return size;
+}
+
+int altinstructions_group_size(struct kpatch_elf *kelf, int offset)
+{
+	static int size = 0;
+	char *str;
+
+	if (!size) {
+		str = getenv("ALT_STRUCT_SIZE");
+		if (!str)
+			ERROR("ALT_STRUCT_SIZE not set");
+		size = atoi(str);
+	}
+
+	return size;
+}
+
+int smp_locks_group_size(struct kpatch_elf *kelf, int offset)
+{
+	return 4;
+}
 
 /*
  * The rela groups in the .fixup section vary in size.  The beginning of each
@@ -1747,7 +1927,7 @@ struct special_section special_sections[] = {
 		.group_size	= fixup_group_size,
 	},
 	{
-		.name		= "__ex_table",
+		.name		= "__ex_table", /* must come after .fixup */
 		.group_size	= ex_table_group_size,
 	},
 	{
@@ -2392,7 +2572,7 @@ void kpatch_create_dynamic_rela_sections(struct kpatch_elf *kelf,
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (!is_rela_section(sec))
 			continue;
-		if (!strcmp(sec->name, ".rela.kpatch.patches") ||
+		if (!strcmp(sec->name, ".rela.kpatch.funcs") ||
 		    !strcmp(sec->name, ".rela.kpatch.dynrelas"))
 			continue;
 		list_for_each_entry_safe(rela, safe, &sec->relas, list) {
@@ -2559,7 +2739,8 @@ void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 
 	nr = 0;
 	list_for_each_entry(sym, &kelf->symbols, list)
-		if (sym->type == STT_FUNC && sym->status != SAME)
+		if (sym->type == STT_FUNC && sym->status != SAME &&
+		    sym->has_fentry_call)
 			nr++;
 
 	/* create text/rela section pair */
@@ -2572,6 +2753,12 @@ void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 	list_for_each_entry(sym, &kelf->symbols, list) {
 		if (sym->type != STT_FUNC || sym->status == SAME)
 			continue;
+
+		if (!sym->has_fentry_call) {
+			log_debug("function %s has no fentry call, no mcount record is needed\n",
+				  sym->name);
+			continue;
+		}
 
 		/* add rela in .rela__mcount_loc to fill in function pointer */
 		ALLOC_LINK(rela, &relasec->relas);
@@ -2589,7 +2776,8 @@ void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 		sym->sec->data->d_buf = newdata;
 		insn = newdata;
 		if (insn[0] != 0xf)
-			ERROR("function '%s' has no fentry call; unable to patch", sym->name);
+			ERROR("%s: unexpected instruction at the start of the function",
+			      sym->name);
 		insn[0] = 0xe8;
 		insn[1] = 0;
 		insn[2] = 0;
@@ -2598,9 +2786,6 @@ void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 
 		rela = list_first_entry(&sym->sec->rela->relas, struct rela,
 					list);
-		if (rela->type != R_X86_64_NONE ||
-		    strcmp(rela->sym->name, "__fentry__"))
-			ERROR("function '%s' has no fentry call; unable to patch", sym->name);
 		rela->type = R_X86_64_PC32;
 
 		index++;
@@ -2918,6 +3103,7 @@ int main(int argc, char *argv[])
 	 */
 	kpatch_mark_ignored_sections(kelf_patched);
 	kpatch_compare_correlated_elements(kelf_patched);
+	kpatch_check_fentry_calls(kelf_patched);
 	kpatch_elf_teardown(kelf_base);
 	kpatch_elf_free(kelf_base);
 
@@ -2934,6 +3120,9 @@ int main(int argc, char *argv[])
 	kpatch_print_changes(kelf_patched);
 	kpatch_dump_kelf(kelf_patched);
 
+	kpatch_process_special_sections(kelf_patched);
+	kpatch_verify_patchability(kelf_patched);
+
 	if (!num_changed && !new_globals_exist) {
 		if (hooks_exist)
 			log_debug("no changed functions were found, but hooks exist\n");
@@ -2942,9 +3131,6 @@ int main(int argc, char *argv[])
 			return 3; /* 1 is ERROR, 2 is DIFF_FATAL */
 		}
 	}
-
-	kpatch_process_special_sections(kelf_patched);
-	kpatch_verify_patchability(kelf_patched);
 
 	/* this is destructive to kelf_patched */
 	kpatch_migrate_included_elements(kelf_patched, &kelf_out);
