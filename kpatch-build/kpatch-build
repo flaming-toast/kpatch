@@ -571,7 +571,8 @@ rm -f checksum.tmp
 cd "$TEMPDIR/patch"
 KPATCH_BUILD="$SRCDIR" KPATCH_NAME="$PATCHNAME" KBUILD_EXTRA_SYMBOLS="$SYMVERSFILE" make "O=$OBJDIR" >> "$LOGFILE" 2>&1 || die
 
-cp -f "$TEMPDIR/patch/kpatch-$PATCHNAME.ko" "$BASE" || die
+"$TOOLSDIR"/kpatch-modpost "$TEMPDIR/patch/kpatch-$PATCHNAME.ko" "$TEMPDIR/patch/kpatch-final.ko"
+cp -f "$TEMPDIR/patch/kpatch-final.ko" "$BASE/kpatch-$PATCHNAME.ko" || die
 
 [[ "$DEBUG" -eq 0 ]] && rm -f "$LOGFILE"
 
