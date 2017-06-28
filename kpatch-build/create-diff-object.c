@@ -919,14 +919,14 @@ static void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 				continue;
 			}
 
-			if (rela->type == R_X86_64_PC32) {
+			if (rela->type == R_390_PC32) {
 				struct insn insn;
 				rela_insn(sec, rela, &insn);
 				add_off = (long)insn.next_byte -
 					  (long)sec->base->data->d_buf -
 					  rela->offset;
-			} else if (rela->type == R_X86_64_64 ||
-				   rela->type == R_X86_64_32S)
+			} else if (rela->type == R_390_64 ||
+				   rela->type == R_390_PC32DBL)
 				add_off = 0;
 			else
 				continue;
@@ -946,7 +946,7 @@ static void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 				end = sym->sym.st_value + sym->sym.st_size;
 
 				if (!is_text_section(sym->sec) &&
-				    rela->type == R_X86_64_32S &&
+				    rela->type == R_390_32 &&
 				    rela->addend == sym->sec->sh.sh_size &&
 				    end == sym->sec->sh.sh_size) {
 
@@ -1000,6 +1000,26 @@ static void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 	log_debug("\n");
 }
 
+/*
+ * TODO: convert this func to s390x, it's commented out for now
+ *
+ * __fentry__ calls are x86 only, for s390x we may need to check for the first
+ * instruction that is expected to be there when gcc's -mhotpatch is used.
+ *
+ * Quote from arch/s390/kernel/ftrace.c -
+ * ---
+ * In case we use gcc's hotpatch feature the original and also the disabled
+ * function prologue contains only a single six byte instruction and looks
+ * like this:
+ * >    brcl    0,0                     # offset 0
+ * To enable ftrace the code gets patched like above and afterwards looks
+ * like this:
+ * >    brasl   %r0,ftrace_caller       # offset 0
+ * ---
+ *
+ * See arch/s390/kernel/ftrace.c for more information.
+ */
+/*
 static void kpatch_check_fentry_calls(struct kpatch_elf *kelf)
 {
 	struct symbol *sym;
@@ -1018,6 +1038,7 @@ static void kpatch_check_fentry_calls(struct kpatch_elf *kelf)
 	if (errs)
 		DIFF_FATAL("%d function(s) can not be patched", errs);
 }
+*/
 
 static void kpatch_verify_patchability(struct kpatch_elf *kelf)
 {
@@ -1628,9 +1649,12 @@ static void kpatch_include_debug_sections(struct kpatch_elf *kelf)
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (!is_rela_section(sec) || !is_debug_section(sec))
 			continue;
-		list_for_each_entry_safe(rela, saferela, &sec->relas, list)
+		list_for_each_entry_safe(rela, saferela, &sec->relas, list) {
 			if (!rela->sym->sec->include)
 				list_del(&rela->list);
+			else
+				rela->sym->include = 1;
+		}
 	}
 }
 
@@ -1749,7 +1773,7 @@ static void kpatch_create_kpatch_arch_section(struct kpatch_elf *kelf, char *obj
 		/* entries[index].sec */
 		ALLOC_LINK(rela, &karch_sec->rela->relas);
 		rela->sym = sec->secsym;
-		rela->type = R_X86_64_64;
+		rela->type = R_390_64;
 		rela->addend = 0;
 		rela->offset = index * sizeof(*entries) + \
 			       offsetof(struct kpatch_arch, sec);
@@ -1757,7 +1781,7 @@ static void kpatch_create_kpatch_arch_section(struct kpatch_elf *kelf, char *obj
 		/* entries[index].objname */
 		ALLOC_LINK(rela, &karch_sec->rela->relas);
 		rela->sym = strsym;
-		rela->type = R_X86_64_64;
+		rela->type = R_390_64;
 		rela->addend = offset_of_string(&kelf->strings, objname);
 		rela->offset = index * sizeof(*entries) + \
 			       offsetof(struct kpatch_arch, objname);
@@ -1916,7 +1940,7 @@ static void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 			 */
 			ALLOC_LINK(rela, &relasec->relas);
 			rela->sym = sym;
-			rela->type = R_X86_64_64;
+			rela->type = R_390_64;
 			rela->addend = 0;
 			rela->offset = index * sizeof(*funcs);
 
@@ -1926,7 +1950,7 @@ static void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 			 */
 			ALLOC_LINK(rela, &relasec->relas);
 			rela->sym = strsym;
-			rela->type = R_X86_64_64;
+			rela->type = R_390_64;
 			rela->addend = offset_of_string(&kelf->strings, sym->name);
 			rela->offset = index * sizeof(*funcs) +
 			               offsetof(struct kpatch_patch_func, name);
@@ -1937,7 +1961,7 @@ static void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 			 */
 			ALLOC_LINK(rela, &relasec->relas);
 			rela->sym = strsym;
-			rela->type = R_X86_64_64;
+			rela->type = R_390_64;
 			rela->addend = objname_offset;
 			rela->offset = index * sizeof(*funcs) +
 			               offsetof(struct kpatch_patch_func,objname);
@@ -2125,7 +2149,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 			/* add rela to fill in ksyms[index].name field */
 			ALLOC_LINK(rela2, &ksym_sec->rela->relas);
 			rela2->sym = strsym;
-			rela2->type = R_X86_64_64;
+			rela2->type = R_390_64;
 			rela2->addend = offset_of_string(&kelf->strings, rela->sym->name);
 			rela2->offset = index * sizeof(*ksyms) + \
 					offsetof(struct kpatch_symbol, name);
@@ -2133,7 +2157,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 			/* add rela to fill in ksyms[index].objname field */
 			ALLOC_LINK(rela2, &ksym_sec->rela->relas);
 			rela2->sym = strsym;
-			rela2->type = R_X86_64_64;
+			rela2->type = R_390_64;
 			rela2->addend = offset_of_string(&kelf->strings, sym_objname);
 			rela2->offset = index * sizeof(*ksyms) + \
 					offsetof(struct kpatch_symbol, objname);
@@ -2154,7 +2178,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 				ERROR("can't create dynrela for section %s (symbol %s): no bundled section or section symbol",
 				      sec->name, rela->sym->name);
 
-			rela2->type = R_X86_64_64;
+			rela2->type = R_390_64;
 			rela2->addend = rela->offset;
 			rela2->offset = index * sizeof(*krelas) + \
 					offsetof(struct kpatch_relocation, dest);
@@ -2162,7 +2186,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 			/* add rela to fill in krelas[index].objname field */
 			ALLOC_LINK(rela2, &krela_sec->rela->relas);
 			rela2->sym = strsym;
-			rela2->type = R_X86_64_64;
+			rela2->type = R_390_64;
 			rela2->addend = offset_of_string(&kelf->strings, objname);
 			rela2->offset = index * sizeof(*krelas) + \
 				offsetof(struct kpatch_relocation, objname);
@@ -2170,7 +2194,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 			/* add rela to fill in krelas[index].ksym field */
 			ALLOC_LINK(rela2, &krela_sec->rela->relas);
 			rela2->sym = ksym_sec_sym;
-			rela2->type = R_X86_64_64;
+			rela2->type = R_390_64;
 			rela2->addend = index * sizeof(*ksyms);
 			rela2->offset = index * sizeof(*krelas) + \
 				offsetof(struct kpatch_relocation, ksym);
@@ -2213,7 +2237,7 @@ static void kpatch_create_hooks_objname_rela(struct kpatch_elf *kelf, char *objn
 
 		ALLOC_LINK(rela, &sec->relas);
 		rela->sym = strsym;
-		rela->type = R_X86_64_64;
+		rela->type = R_390_64;
 		rela->addend = objname_offset;
 		rela->offset = offsetof(struct kpatch_patch_hook, objname);
 	}
@@ -2225,7 +2249,11 @@ static void kpatch_create_hooks_objname_rela(struct kpatch_elf *kelf, char *objn
  *
  * TODO: Eventually we can modify recordmount so that it recognizes our bundled
  * sections as valid and does this work for us.
+ *
+ * TODO: This function must be ported to s390x (no fentry, different hotpatch
+ * prologue)
  */
+/*
 static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 {
 	int nr, index;
@@ -2241,12 +2269,12 @@ static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 		    sym->has_fentry_call)
 			nr++;
 
-	/* create text/rela section pair */
+	// create text/rela section pair
 	sec = create_section_pair(kelf, "__mcount_loc", sizeof(*funcs), nr);
 	relasec = sec->rela;
 	funcs = sec->data->d_buf;
 
-	/* populate sections */
+	// populate sections
 	index = 0;
 	list_for_each_entry(sym, &kelf->symbols, list) {
 		if (sym->type != STT_FUNC || sym->status == SAME)
@@ -2258,17 +2286,15 @@ static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 			continue;
 		}
 
-		/* add rela in .rela__mcount_loc to fill in function pointer */
+		// add rela in .rela__mcount_loc to fill in function pointer
 		ALLOC_LINK(rela, &relasec->relas);
 		rela->sym = sym;
-		rela->type = R_X86_64_64;
+		rela->type = R_390_64;
 		rela->addend = 0;
 		rela->offset = index * sizeof(*funcs);
 
-		/*
-		 * Modify the first instruction of the function to "callq
-		 * __fentry__" so that ftrace will be happy.
-		 */
+		// Modify the first instruction of the function to "callq
+		// __fentry__" so that ftrace will be happy.
 		newdata = malloc(sym->sec->data->d_size);
 		memcpy(newdata, sym->sec->data->d_buf, sym->sec->data->d_size);
 		sym->sec->data->d_buf = newdata;
@@ -2284,15 +2310,15 @@ static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 
 		rela = list_first_entry(&sym->sec->rela->relas, struct rela,
 					list);
-		rela->type = R_X86_64_PC32;
+		rela->type = R_390_PC32;
 
 		index++;
 	}
 
-	/* sanity check, index should equal nr */
 	if (index != nr)
 		ERROR("size mismatch in funcs sections");
 }
+*/
 
 /*
  * This function strips out symbols that were referenced by changed rela
@@ -2462,7 +2488,7 @@ int main(int argc, char *argv[])
 	 */
 	kpatch_mark_ignored_sections(kelf_patched);
 	kpatch_compare_correlated_elements(kelf_patched);
-	kpatch_check_fentry_calls(kelf_patched);
+//	kpatch_check_fentry_calls(kelf_patched); /* s390x: see TODO comment */
 	kpatch_elf_teardown(kelf_base);
 	kpatch_elf_free(kelf_base);
 
@@ -2537,7 +2563,7 @@ int main(int argc, char *argv[])
 	kpatch_create_hooks_objname_rela(kelf_out, objname);
 	kpatch_build_strings_section_data(kelf_out);
 
-	kpatch_create_mcount_sections(kelf_out);
+//	kpatch_create_mcount_sections(kelf_out); /* s390x: see TODO comment */
 
 	/*
 	 *  At this point, the set of output sections and symbols is

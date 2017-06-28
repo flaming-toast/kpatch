@@ -71,7 +71,16 @@ int is_debug_section(struct section *sec)
 		name = sec->base->name;
 	else
 		name = sec->name;
-	return !strncmp(name, ".debug_", 7);
+
+	/*
+	 * .eh_frame is included on s390x but discarded in vmlinux.lds.S on x86, so I
+	 * automatically included it as a debug section wit the rest of the .debug*
+	 * sections...
+	 *
+	 * Update Jan 18 2018: Josh implemented this as commit 2b39f7d8d86b1
+	 * kpatch-s390x needs to be updated against master :-/
+	 */
+	return !strncmp(name, ".debug_", 7) || !strncmp(name, ".eh_frame", 9);
 }
 
 struct section *find_section_by_index(struct list_head *list, unsigned int index)
@@ -151,7 +160,7 @@ int offset_of_string(struct list_head *list, char *name)
 
 void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 {
-	int rela_nr, index = 0, skip = 0;
+	int addend, rela_nr, index = 0, skip = 0;
 	struct rela *rela;
 	unsigned int symndx;
 
@@ -190,7 +199,12 @@ void kpatch_create_rela_list(struct kpatch_elf *kelf, struct section *sec)
 			ERROR("could not find rela entry symbol\n");
 		if (rela->sym->sec &&
 		    (rela->sym->sec->sh.sh_flags & SHF_STRINGS)) {
-			rela->string = rela->sym->sec->data->d_buf + rela->addend;
+			if (!strncmp(rela->sym->name, ".LC", 3) ||
+			    !strncmp(rela->sym->name, ".LASF", 5))
+				addend = rela->sym->sym.st_value;
+			else
+				addend = rela->addend;
+			rela->string = rela->sym->sec->data->d_buf + addend;
 			if (!rela->string)
 				ERROR("could not lookup rela string for %s+%d",
 				      rela->sym->name, rela->addend);
