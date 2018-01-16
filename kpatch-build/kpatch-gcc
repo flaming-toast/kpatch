@@ -17,6 +17,9 @@ if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
 			obj=$2
 			[[ $2 = */.tmp_*.o ]] && obj=${2/.tmp_/}
 			case "$obj" in
+				# s390x does not have HAVE_C_RECORDMCOUNT, so recordmcount.pl is used, and it
+				# creates temporary .tmp_mc_*.o files...ignore them
+				*mc_*.o|\
 				*.mod.o|\
 				*built-in.o|\
 				vmlinux.o|\
